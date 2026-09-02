@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- The Settings integrations tab now shows Jcode when its native Herdr bridge is available on `PATH`.
+
 ### Added
 - Added first-class Jcode process and screen-state detection, native session persistence and restore with `jcode --resume`, per-agent sound configuration, and fork automation for regular upstream synchronization.
 - Custom themes can now define separate light and dark color overrides when automatic theme switching is enabled. (#837, thanks @aneym)

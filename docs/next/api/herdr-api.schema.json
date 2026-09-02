@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "protocol": 22,
+  "protocol": 23,
   "schema_version": 1,
   "schemas": {
     "error_response": {
@@ -2148,6 +2148,7 @@
           "enum": [
             "pi",
             "omp",
+            "jcode",
             "claude",
             "codex",
             "copilot",
@@ -7666,6 +7667,7 @@
           "enum": [
             "pi",
             "omp",
+            "jcode",
             "claude",
             "codex",
             "copilot",

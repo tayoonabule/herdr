@@ -10,6 +10,7 @@ pub(crate) fn integration_target_label(
     match target {
         crate::api::schema::IntegrationTarget::Pi => "pi",
         crate::api::schema::IntegrationTarget::Omp => "omp",
+        crate::api::schema::IntegrationTarget::Jcode => "jcode",
         crate::api::schema::IntegrationTarget::Claude => "claude",
         crate::api::schema::IntegrationTarget::Codex => "codex",
         crate::api::schema::IntegrationTarget::Copilot => "copilot",
@@ -40,6 +41,7 @@ pub(crate) fn integration_target_command_names(
     match target {
         crate::api::schema::IntegrationTarget::Pi => &["pi"],
         crate::api::schema::IntegrationTarget::Omp => &["omp"],
+        crate::api::schema::IntegrationTarget::Jcode => &["jcode"],
         crate::api::schema::IntegrationTarget::Claude => &["claude"],
         crate::api::schema::IntegrationTarget::Codex => &["codex"],
         crate::api::schema::IntegrationTarget::Copilot => &["copilot"],
@@ -69,6 +71,7 @@ pub(crate) fn integration_target_supported(target: crate::api::schema::Integrati
             target,
             crate::api::schema::IntegrationTarget::Pi
                 | crate::api::schema::IntegrationTarget::Omp
+                | crate::api::schema::IntegrationTarget::Jcode
                 | crate::api::schema::IntegrationTarget::Claude
                 | crate::api::schema::IntegrationTarget::Codex
                 | crate::api::schema::IntegrationTarget::Copilot
@@ -126,13 +129,15 @@ pub(crate) fn integration_target_install_layout_available(
 }
 
 pub(crate) fn command_available(command: &str) -> bool {
-    let Some(paths) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&paths).any(|dir| {
+    command_path(command).is_some()
+}
+
+fn command_path(command: &str) -> Option<PathBuf> {
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths).find_map(|dir| {
         command_path_candidates(&dir, command)
             .into_iter()
-            .any(|path| executable_file_exists(&path))
+            .find(|path| executable_file_exists(path))
     })
 }
 
@@ -223,37 +228,67 @@ pub(crate) fn hermes_install_layout_available() -> bool {
 }
 
 pub(crate) fn installed_integration_statuses() -> Vec<super::IntegrationStatus> {
-    integration_specs()
-        .into_iter()
-        .filter_map(|(target, path, expected_version)| {
-            if !integration_target_supported(target) {
-                return None;
-            }
-            Some(integration_status_at(target, path.ok()?, expected_version))
-        })
+    std::iter::once(jcode_native_status())
+        .chain(
+            integration_specs()
+                .into_iter()
+                .filter_map(|(target, path, expected_version)| {
+                    if !integration_target_supported(target) {
+                        return None;
+                    }
+                    Some(integration_status_at(target, path.ok()?, expected_version))
+                }),
+        )
         .collect()
 }
 
 pub(crate) fn integration_recommendations() -> Vec<super::IntegrationRecommendation> {
-    integration_specs()
-        .into_iter()
-        .filter_map(|(target, path, expected_version)| {
-            if !integration_target_supported(target) {
-                return None;
-            }
-            let path = path.ok()?;
-            let status = integration_status_at(target, path.clone(), expected_version);
-            Some(super::IntegrationRecommendation {
-                target,
-                label: integration_target_label(target),
-                command: integration_target_command(target),
-                available: integration_target_available(target)
-                    || status.state != super::IntegrationStatusKind::NotInstalled,
-                path,
-                state: status.state,
-            })
-        })
-        .collect()
+    let jcode = jcode_native_status();
+    std::iter::once(super::IntegrationRecommendation {
+        target: jcode.target,
+        label: integration_target_label(jcode.target),
+        command: integration_target_command(jcode.target),
+        available: jcode.state == super::IntegrationStatusKind::Current,
+        path: jcode.path,
+        state: jcode.state,
+    })
+    .chain(
+        integration_specs()
+            .into_iter()
+            .filter_map(|(target, path, expected_version)| {
+                if !integration_target_supported(target) {
+                    return None;
+                }
+                let path = path.ok()?;
+                let status = integration_status_at(target, path.clone(), expected_version);
+                Some(super::IntegrationRecommendation {
+                    target,
+                    label: integration_target_label(target),
+                    command: integration_target_command(target),
+                    available: integration_target_available(target)
+                        || status.state != super::IntegrationStatusKind::NotInstalled,
+                    path,
+                    state: status.state,
+                })
+            }),
+    )
+    .collect()
+}
+
+fn jcode_native_status() -> super::IntegrationStatus {
+    let executable = command_path("jcode");
+    let current = executable.is_some();
+    super::IntegrationStatus {
+        target: crate::api::schema::IntegrationTarget::Jcode,
+        path: executable.unwrap_or_else(|| PathBuf::from("jcode")),
+        state: if current {
+            super::IntegrationStatusKind::Current
+        } else {
+            super::IntegrationStatusKind::NotInstalled
+        },
+        installed_version: current.then_some(super::JCODE_NATIVE_INTEGRATION_VERSION),
+        expected_version: super::JCODE_NATIVE_INTEGRATION_VERSION,
+    }
 }
 
 pub(crate) fn outdated_installed_integrations() -> Vec<super::IntegrationStatus> {

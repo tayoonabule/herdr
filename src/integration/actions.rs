@@ -58,6 +58,14 @@ fn install_target_inner(target: crate::api::schema::IntegrationTarget) -> io::Re
             ));
             messages
         }
+        crate::api::schema::IntegrationTarget::Jcode => {
+            if !super::registry::integration_target_available(target) {
+                return Err(io::Error::other(
+                    "jcode is not available; install jcode before enabling its built-in Herdr integration",
+                ));
+            }
+            vec!["jcode includes a built-in Herdr integration; no installation was needed".into()]
+        }
         crate::api::schema::IntegrationTarget::Claude => {
             let installed = install_claude()?;
             vec![
@@ -295,6 +303,9 @@ pub(crate) fn uninstall_target(
                 )]
             }
         }
+        crate::api::schema::IntegrationTarget::Jcode => vec![
+            "jcode's Herdr integration is built in and cannot be uninstalled separately".into(),
+        ],
         crate::api::schema::IntegrationTarget::Claude => {
             let result = uninstall_claude()?;
             let mut messages = Vec::new();

@@ -302,6 +302,51 @@ fn command_available_requires_executable_file_on_path() {
 }
 
 #[test]
+#[cfg(unix)]
+fn native_jcode_recommendation_is_current_when_jcode_is_on_path() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _lock = integration_env_lock();
+    let base = unique_base();
+    let bin = base.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let jcode = bin.join("jcode");
+    fs::write(&jcode, "#!/bin/sh\n").unwrap();
+    fs::set_permissions(&jcode, fs::Permissions::from_mode(0o755)).unwrap();
+    let original_path = std::env::var_os("PATH");
+    std::env::set_var("PATH", &bin);
+
+    let recommendation = integration_recommendations()
+        .into_iter()
+        .find(|recommendation| {
+            recommendation.target == crate::api::schema::IntegrationTarget::Jcode
+        })
+        .expect("jcode recommendation should be present");
+    assert_eq!(recommendation.label, "jcode");
+    assert_eq!(recommendation.command, "jcode");
+    assert!(recommendation.available);
+    assert_eq!(recommendation.state, IntegrationStatusKind::Current);
+    assert!(!recommendation.needs_install());
+
+    let status = installed_integration_statuses()
+        .into_iter()
+        .find(|status| status.target == crate::api::schema::IntegrationTarget::Jcode)
+        .expect("jcode status should be present");
+    assert_eq!(
+        status.installed_version,
+        Some(JCODE_NATIVE_INTEGRATION_VERSION)
+    );
+    assert_eq!(status.expected_version, JCODE_NATIVE_INTEGRATION_VERSION);
+
+    if let Some(path) = original_path {
+        std::env::set_var("PATH", path);
+    } else {
+        std::env::remove_var("PATH");
+    }
+    let _ = fs::remove_dir_all(base);
+}
+
+#[test]
 #[cfg(windows)]
 fn command_available_finds_windows_command_shims_on_path() {
     let _lock = integration_env_lock();
