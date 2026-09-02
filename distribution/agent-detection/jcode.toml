@@ -1,0 +1,56 @@
+id = "jcode"
+version = "2026.09.02.1"
+min_engine_version = 1
+updated_at = "2026-09-02T00:00:00Z"
+aliases = ["j-code"]
+
+[[rules]]
+id = "interactive_auth_wait"
+state = "blocked"
+priority = 900
+region = "bottom_non_empty_lines(16)"
+visible_blocker = true
+any = [
+  { contains = ["waiting for browser approval"], any = [{ contains = ["/cancel"] }, { contains = ["Approve the request"] }] },
+  { contains = ["Jcode Account Login", "Approve the request in the same browser", "waiting for the single-use exchange"] },
+  { contains = ["Jcode account: waiting for spending limit"] },
+  { contains = ["Auto import is waiting for your selection"] },
+  { contains = ["Approve sources [a=all, Enter=skip"] },
+]
+
+[[rules]]
+id = "interactive_decision"
+state = "blocked"
+priority = 850
+region = "bottom_non_empty_lines(16)"
+visible_blocker = true
+any = [
+  { contains = ["Log in to OpenAI?", "Yes", "No"] },
+  { contains = ["Continue a session where you left off in", "Yes/No"] },
+  { contains = ["This prompt is waiting for the", "API key", "/cancel"] },
+]
+
+[[rules]]
+id = "working_spinner"
+state = "working"
+priority = 700
+region = "bottom_non_empty_lines(4)"
+visible_working = true
+line_regex = ['^[\x{2800}-\x{28FF}]\s+\S.*(?:…|\.\.\.)\s+\d+s(?:\s+·.*)?$']
+not = [{ line_regex = ['^\d+>\s?.*$'] }]
+
+[[rules]]
+id = "working_prompt"
+state = "working"
+priority = 650
+region = "bottom_non_empty_lines(2)"
+visible_working = true
+line_regex = ['^\d+…(?:\s+.*)?$']
+
+[[rules]]
+id = "idle_prompt"
+state = "idle"
+priority = 100
+region = "bottom_non_empty_lines(3)"
+visible_idle = true
+line_regex = ['^\d+>\s?.*$']

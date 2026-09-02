@@ -83,6 +83,7 @@ pub fn is_reserved_native_state_source(source: &str, agent: &str) -> bool {
     matches!(
         (source, agent),
         ("herdr:claude", "claude")
+            | ("herdr:jcode", "jcode")
             | ("herdr:codex", "codex")
             | ("herdr:copilot", "copilot")
             | ("herdr:devin", "devin")
@@ -127,6 +128,9 @@ pub fn plan(source: &str, agent: &str, session_ref: &AgentSessionRef) -> Option<
                 "--resume".into(),
                 session_ref.value.clone(),
             ]
+        }
+        ("herdr:jcode", "jcode", AgentSessionRefKind::Id) => {
+            vec!["jcode".into(), "--resume".into(), session_ref.value.clone()]
         }
         ("herdr:codex", "codex", AgentSessionRefKind::Id) => {
             vec!["codex".into(), "resume".into(), session_ref.value.clone()]
@@ -228,6 +232,7 @@ pub(crate) fn is_official_agent_source(source: &str, agent: &str) -> bool {
     matches!(
         (source, agent),
         ("herdr:claude", "claude")
+            | ("herdr:jcode", "jcode")
             | ("herdr:codex", "codex")
             | ("herdr:copilot", "copilot")
             | ("herdr:devin", "devin")
@@ -273,6 +278,7 @@ mod tests {
     #[test]
     fn native_state_reservation_excludes_full_lifecycle_sources() {
         assert!(is_reserved_native_state_source("herdr:claude", "claude"));
+        assert!(is_reserved_native_state_source("herdr:jcode", "jcode"));
         assert!(is_reserved_native_state_source("herdr:codex", "codex"));
         assert!(is_reserved_native_state_source("herdr:devin", "devin"));
         assert!(!is_reserved_native_state_source("herdr:kimi", "kimi"));
@@ -295,6 +301,16 @@ mod tests {
             .unwrap()
             .argv,
             vec!["claude", "--resume", "claude-session"]
+        );
+        assert_eq!(
+            plan(
+                "herdr:jcode",
+                "jcode",
+                &AgentSessionRef::id("jcode-session").unwrap()
+            )
+            .unwrap()
+            .argv,
+            vec!["jcode", "--resume", "jcode-session"]
         );
         assert_eq!(
             plan(
@@ -537,6 +553,18 @@ mod tests {
         assert!(
             session_ref_from_report("herdr:claude", "claude", None, Some(claude_session)).is_none()
         );
+
+        let session_ref =
+            session_ref_from_report("herdr:jcode", "jcode", Some("jcode-id".into()), None).unwrap();
+        assert_eq!(session_ref.kind, AgentSessionRefKind::Id);
+        assert_eq!(session_ref.value, "jcode-id");
+        assert!(session_ref_from_report(
+            "herdr:jcode",
+            "jcode",
+            None,
+            Some("/tmp/jcode-session".into())
+        )
+        .is_none());
 
         let session_ref =
             session_ref_from_report("herdr:copilot", "copilot", Some("copilot-id".into()), None)

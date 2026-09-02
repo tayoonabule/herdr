@@ -13,6 +13,7 @@ Automatic detection works out of the box for common coding agents. The table sho
 
 | Agent | State authority | Integration role |
 | --- | --- | --- |
+| Jcode | screen manifest | built-in native session bridge |
 | Pi | lifecycle hooks when installed; otherwise screen manifest | state and session |
 | OMP | lifecycle hooks when installed | state and session |
 | GitHub Copilot CLI | screen manifest | session |
@@ -36,6 +37,8 @@ Automatic detection works out of the box for common coding agents. The table sho
 | Muse | screen manifest | none |
 
 Detected but less thoroughly tested: Gemini CLI and Cline. Unsupported agents still run normally as terminal processes. They just may not get rich state unless you add an integration or report state over the socket API.
+
+Jcode needs no separate `herdr integration install` step. Current Jcode releases detect Herdr automatically, report their native session ID as `herdr:jcode`, and resume with `jcode --resume <id>`. Herdr keeps screen detection authoritative for state so its live prompt, spinner, and interactive login waits remain visible without overriding Jcode's own lifecycle configuration.
 
 ## Status authority
 

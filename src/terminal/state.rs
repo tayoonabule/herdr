@@ -1321,11 +1321,13 @@ impl TerminalState {
                 "herdr:claude",
                 "claude",
                 Some("clear" | "resume" | "compact")
-            ) | (
-                "herdr:codex",
-                "codex",
-                Some("startup" | "clear" | "resume" | "compact")
-            ) | ("herdr:mastracode", "mastracode", Some("startup"))
+            ) | ("herdr:jcode", "jcode", Some("startup" | "resume"))
+                | (
+                    "herdr:codex",
+                    "codex",
+                    Some("startup" | "clear" | "resume" | "compact")
+                )
+                | ("herdr:mastracode", "mastracode", Some("startup"))
                 | ("herdr:hermes", "hermes", Some("startup" | "new" | "resume"))
                 | ("herdr:opencode", "opencode", Some("select"))
                 | ("herdr:pi", "pi", Some("new" | "resume" | "fork"))
@@ -2443,6 +2445,13 @@ mod tests {
     #[test]
     fn session_identity_claims_leave_state_to_detection() {
         for (source, label, agent, start_source, replacement_source) in [
+            (
+                "herdr:jcode",
+                "jcode",
+                Agent::Jcode,
+                Some("startup"),
+                Some("resume"),
+            ),
             (
                 "herdr:hermes",
                 "hermes",

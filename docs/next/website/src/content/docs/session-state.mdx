@@ -64,6 +64,7 @@ Native session restore requires these Herdr integration versions or newer:
 
 | Agent | Minimum Herdr integration version | Resume command |
 | --- | --- | --- |
+| Jcode | Built in | `jcode --resume <id>` |
 | Pi | `2` | `pi --session <path-or-id>` |
 | Antigravity CLI | `1` | `agy --conversation <id>` |
 | OMP | `3` | `omp --resume=<path-or-id>` |
@@ -82,7 +83,7 @@ Native session restore requires these Herdr integration versions or newer:
 | Hermes Agent | `2` | `hermes --resume <id>` |
 | MastraCode | `1` | `mastracode --thread <id>` |
 
-Run `herdr integration status` to check installed integration versions. Reinstall outdated integrations with `herdr integration install <agent>`.
+Jcode reports its native session identity directly when it detects Herdr, so it needs no separate Herdr integration install. For other agents, run `herdr integration status` to check installed integration versions and reinstall outdated integrations with `herdr integration install <agent>`.
 
 Unsupported, missing, invalid, duplicated, or stale session references restore as normal shells in the saved pane directory.
 

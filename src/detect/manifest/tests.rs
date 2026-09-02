@@ -782,6 +782,84 @@ fn claude_empty_osc_empty_screen_is_idle_fallback() {
     assert!(!result.visible_idle);
 }
 
+// --- Jcode screen rules ---
+
+#[test]
+fn jcode_idle_prompt_is_idle() {
+    let screen = " jcode · client\n server: Forge · v0.81.75-dev\n ~/work/project\n\n1>";
+    let result = osc_explain(Agent::Jcode, screen, "jcode fox", "");
+    assert_eq!(result.state, AgentState::Idle, "{result:#?}");
+    assert_eq!(
+        result.matched_rule.as_ref().map(|rule| rule.id.as_str()),
+        Some("idle_prompt")
+    );
+    assert!(result.visible_idle);
+}
+
+#[test]
+fn jcode_spinner_and_ellipsis_prompt_are_working() {
+    for screen in [
+        "1› Ship the change\n⠋ sending context… 4s · https\n2…",
+        "1› Ship the change\n⠹ sending… 1s\n2…",
+        "1› Ship the change\n2…",
+    ] {
+        let result = osc_explain(Agent::Jcode, screen, "jcode fox", "");
+        assert_eq!(result.state, AgentState::Working, "{result:#?}");
+        assert!(result.visible_working, "{result:#?}");
+    }
+}
+
+#[test]
+fn jcode_interactive_auth_wait_is_blocked() {
+    for screen in [
+        "Jcode Account Login\nApprove the request in the same browser.\nJcode is waiting for browser approval.\nType /cancel to abort.\n2>",
+        "Jcode Account Login\nApprove the request in the same browser. Jcode is waiting for the single-use exchange.\n2>",
+        "Jcode Account Approved\nJcode account: waiting for spending limit\n2>",
+        "Auto import is waiting for your selection. Reply with a to approve all, 1,3 to approve specific sources, or /cancel to abort.",
+        "Approve sources [a=all, Enter=skip]:",
+    ] {
+        let result = osc_explain(Agent::Jcode, screen, "jcode fox", "");
+        assert_eq!(result.state, AgentState::Blocked, "{result:#?}");
+        assert_eq!(
+            result.matched_rule.as_ref().map(|rule| rule.id.as_str()),
+            Some("interactive_auth_wait")
+        );
+        assert!(result.visible_blocker);
+    }
+}
+
+#[test]
+fn jcode_interactive_decisions_are_blocked() {
+    for screen in [
+        "Log in to OpenAI?\n◖ Yes ◗   ◖ No ◗",
+        "Continue a session where you left off in Codex? Opens the resume menu in 5s (Yes/No)",
+        "This prompt is waiting for the OpenRouter API key itself. Paste the key, or type /cancel to abort.",
+    ] {
+        let result = osc_explain(Agent::Jcode, screen, "jcode fox", "");
+        assert_eq!(result.state, AgentState::Blocked, "{result:#?}");
+        assert_eq!(
+            result.matched_rule.as_ref().map(|rule| rule.id.as_str()),
+            Some("interactive_decision")
+        );
+        assert!(result.visible_blocker);
+    }
+}
+
+#[test]
+fn jcode_transcript_text_does_not_impersonate_live_working_chrome() {
+    for screen in [
+        "1› Explain this output: ⠋ sending context… 4s · https\n\n2>",
+        "1› Previous status\n⠋ sending context… 4s · https\n2>",
+    ] {
+        let result = osc_explain(Agent::Jcode, screen, "jcode fox", "");
+        assert_eq!(result.state, AgentState::Idle, "{result:#?}");
+        assert_eq!(
+            result.matched_rule.as_ref().map(|rule| rule.id.as_str()),
+            Some("idle_prompt")
+        );
+    }
+}
+
 // --- Codex OSC rules ---
 
 #[test]
