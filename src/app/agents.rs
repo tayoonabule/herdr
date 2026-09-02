@@ -192,6 +192,7 @@ impl App {
         let shell_name = available_shell_name(runtime)
             .ok_or_else(|| AgentStartError::TargetBusy(params.pane_id.clone()))?;
 
+        let resumed_session = managed_agent_resume_session(kind, &params.args);
         let mut argv = vec![crate::detect::interactive_agent_executable(kind).to_string()];
         argv.extend(params.args);
         let command = crate::platform::interactive_shell_command(&argv, &shell_name)
@@ -216,6 +217,9 @@ impl App {
         if let Err(err) = runtime.try_send_bytes(Bytes::from(bytes)) {
             terminal.clear_agent_name();
             return Err(AgentStartError::InputFailed(err.to_string()));
+        }
+        if let Some(session) = resumed_session {
+            terminal.set_persisted_agent_session(session);
         }
         self.state.mark_session_dirty();
         self.schedule_session_save();
@@ -418,6 +422,28 @@ fn available_shell_name(runtime: &crate::terminal::TerminalRuntime) -> Option<St
     crate::platform::available_pane_shell(runtime.child_pid()?)
 }
 
+fn managed_agent_resume_session(
+    kind: crate::detect::Agent,
+    args: &[String],
+) -> Option<crate::agent_resume::PersistedAgentSession> {
+    if kind != crate::detect::Agent::Jcode {
+        return None;
+    }
+
+    let session_id = args
+        .windows(2)
+        .find_map(|pair| (pair[0] == "--resume").then(|| pair[1].clone()))
+        .or_else(|| {
+            args.iter()
+                .find_map(|arg| arg.strip_prefix("--resume=").map(str::to_string))
+        })?;
+    Some(crate::agent_resume::PersistedAgentSession {
+        source: "herdr:jcode".into(),
+        agent: "jcode".into(),
+        session_ref: crate::agent_resume::AgentSessionRef::id(session_id)?,
+    })
+}
+
 pub(super) fn runtime_hosts_agent(
     runtime: &crate::terminal::TerminalRuntime,
     expected: crate::detect::Agent,
@@ -468,7 +494,7 @@ pub(super) enum AgentRenameError {
 
 #[cfg(test)]
 mod tests {
-    use super::valid_agent_name;
+    use super::{managed_agent_resume_session, valid_agent_name};
 
     #[test]
     fn agent_names_use_a_small_cli_safe_grammar() {
@@ -487,5 +513,28 @@ mod tests {
         ] {
             assert!(!valid_agent_name(name), "expected {name:?} to be invalid");
         }
+    }
+
+    #[test]
+    fn jcode_resume_arguments_seed_the_native_session_identity() {
+        for args in [
+            vec!["--resume".into(), "session-123".into()],
+            vec!["--resume=session-123".into()],
+        ] {
+            let session = managed_agent_resume_session(crate::detect::Agent::Jcode, &args).unwrap();
+            assert_eq!(session.source, "herdr:jcode");
+            assert_eq!(session.agent, "jcode");
+            assert_eq!(session.session_ref.value, "session-123");
+        }
+        assert!(managed_agent_resume_session(
+            crate::detect::Agent::Claude,
+            &["--resume".into(), "session-123".into()]
+        )
+        .is_none());
+        assert!(managed_agent_resume_session(
+            crate::detect::Agent::Jcode,
+            &["--resume".into(), "bad\nsession".into()]
+        )
+        .is_none());
     }
 }
