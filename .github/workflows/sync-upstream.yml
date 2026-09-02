@@ -1,0 +1,135 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: sync-upstream-master
+  cancel-in-progress: false
+
+env:
+  RUST_TOOLCHAIN_VERSION: 1.96.1
+
+jobs:
+  validate:
+    if: github.repository == 'tayoonabule/herdr'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    outputs:
+      changed: ${{ steps.merge.outputs.changed }}
+    steps:
+      - name: Check out fork
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: master
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch and merge upstream master
+        id: merge
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/herdrdev/herdr.git
+          git fetch --prune upstream master
+          if git merge-base --is-ancestor upstream/master HEAD; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Fork master already contains upstream/master." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git merge --no-ff --no-edit -m "chore(sync): merge upstream/master" upstream/master
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust
+        if: steps.merge.outputs.changed == 'true'
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+          components: rustfmt,clippy
+
+      - name: Install build tools
+        if: steps.merge.outputs.changed == 'true'
+        uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2.81.9
+        with:
+          tool: just,cargo-nextest
+
+      - name: Install Bun
+        if: steps.merge.outputs.changed == 'true'
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Install Zig
+        if: steps.merge.outputs.changed == 'true'
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.15.2
+
+      - name: Verify merged fork
+        if: steps.merge.outputs.changed == 'true'
+        run: just check
+
+      - name: Package validated merge
+        if: steps.merge.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          mkdir upstream-sync-candidate
+          git bundle create upstream-sync-candidate/merge.bundle HEAD
+          git rev-parse HEAD > upstream-sync-candidate/candidate-sha
+          git rev-parse HEAD^1 > upstream-sync-candidate/base-sha
+          git rev-parse HEAD^2 > upstream-sync-candidate/upstream-sha
+
+      - name: Upload validated merge
+        if: steps.merge.outputs.changed == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: upstream-sync-candidate
+          path: upstream-sync-candidate
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    if: needs.validate.outputs.changed == 'true'
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Check out current fork master
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: master
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Download validated merge
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: upstream-sync-candidate
+          path: upstream-sync-candidate
+
+      - name: Verify and push the exact validated merge
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/herdrdev/herdr.git
+          git fetch --prune origin master
+          git fetch --prune upstream master
+
+          candidate=$(cat upstream-sync-candidate/candidate-sha)
+          base=$(cat upstream-sync-candidate/base-sha)
+          upstream_sha=$(cat upstream-sync-candidate/upstream-sha)
+          test "$base" = "$(git rev-parse origin/master)"
+          test "$upstream_sha" = "$(git rev-parse upstream/master)"
+
+          git bundle verify upstream-sync-candidate/merge.bundle
+          git fetch upstream-sync-candidate/merge.bundle HEAD:refs/remotes/sync/candidate
+          test "$candidate" = "$(git rev-parse refs/remotes/sync/candidate)"
+          test "$base" = "$(git rev-parse refs/remotes/sync/candidate^1)"
+          test "$upstream_sha" = "$(git rev-parse refs/remotes/sync/candidate^2)"
+          git push origin "$candidate":master
