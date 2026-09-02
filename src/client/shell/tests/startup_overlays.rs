@@ -1196,6 +1196,13 @@ fn client_settings_preview_restore_and_endpoint_integrations_are_owned_by_overla
                 Ok(crate::api::schema::ResponseResult::IntegrationList {
                     integrations: vec![
                         crate::api::schema::IntegrationInfo {
+                            target: crate::api::schema::IntegrationTarget::Jcode,
+                            label: "jcode".into(),
+                            command: "jcode".into(),
+                            available: true,
+                            state: crate::api::schema::IntegrationState::Current,
+                        },
+                        crate::api::schema::IntegrationInfo {
                             target: crate::api::schema::IntegrationTarget::Codex,
                             label: "codex".into(),
                             command: "codex".into(),
@@ -1227,6 +1234,8 @@ fn client_settings_preview_restore_and_endpoint_integrations_are_owned_by_overla
         .join("\n");
     assert!(text.contains("update available"));
     assert!(text.contains("not found"));
+    assert!(text.contains("jcode"));
+    assert!(text.contains("installed"));
     assert!(!text.contains("pane labels"));
 
     let popup = state.hits.settings_popup;
