@@ -176,6 +176,13 @@ pub(crate) struct TerminalReadSnapshot {
     pub truncated: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TerminalCompressionStep {
+    Busy,
+    ActivityChanged(u64),
+    Compressed(crate::ghostty::TerminalCompressionResult),
+}
+
 pub(crate) struct GhosttyPaneTerminal {
     pub core: Mutex<GhosttyPaneCore>,
     key_encoder: Mutex<crate::ghostty::KeyEncoder>,
@@ -477,6 +484,18 @@ impl PaneTerminal {
 
     pub fn detection_text(&self) -> String {
         self.ghostty.detection_text()
+    }
+
+    pub(crate) fn try_compression_activity(&self) -> Result<Option<u64>, crate::ghostty::Error> {
+        self.ghostty.try_compression_activity()
+    }
+
+    pub(crate) fn try_compress_incremental_if_activity(
+        &self,
+        expected_activity: u64,
+    ) -> Result<TerminalCompressionStep, crate::ghostty::Error> {
+        self.ghostty
+            .try_compress_incremental_if_activity(expected_activity)
     }
 
     pub(crate) fn recent_text_snapshot(&self, lines: usize) -> TerminalReadSnapshot {
@@ -2074,6 +2093,37 @@ impl GhosttyPaneTerminal {
             .unwrap_or_default()
     }
 
+    fn try_lock_core(&self) -> Option<std::sync::MutexGuard<'_, GhosttyPaneCore>> {
+        match self.core.try_lock() {
+            Ok(core) => Some(core),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+        }
+    }
+
+    pub(crate) fn try_compression_activity(&self) -> Result<Option<u64>, crate::ghostty::Error> {
+        let Some(core) = self.try_lock_core() else {
+            return Ok(None);
+        };
+        core.terminal.compression_activity().map(Some)
+    }
+
+    pub(crate) fn try_compress_incremental_if_activity(
+        &self,
+        expected_activity: u64,
+    ) -> Result<TerminalCompressionStep, crate::ghostty::Error> {
+        let Some(mut core) = self.try_lock_core() else {
+            return Ok(TerminalCompressionStep::Busy);
+        };
+        let activity = core.terminal.compression_activity()?;
+        if activity != expected_activity {
+            return Ok(TerminalCompressionStep::ActivityChanged(activity));
+        }
+        core.terminal
+            .compress_incremental()
+            .map(TerminalCompressionStep::Compressed)
+    }
+
     #[cfg(test)]
     pub fn recent_text(&self, lines: usize) -> String {
         self.recent_text_snapshot(lines).text
@@ -2807,7 +2857,34 @@ fn ghostty_recent_read_range(
     if total_rows == 0 || cols == 0 || lines == 0 {
         return Ok(None);
     }
-    let end = total_rows.saturating_sub(1);
+
+    let physical_end = total_rows.saturating_sub(1);
+    if terminal.active_screen()? != crate::ghostty::ActiveScreen::Primary {
+        let start = physical_end.saturating_add(1).saturating_sub(lines);
+        return Ok(Some((start, physical_end, cols)));
+    }
+
+    let rows = usize::from(terminal.rows()?);
+    if rows == 0 {
+        return Ok(None);
+    }
+    let viewport_start = total_rows.saturating_sub(rows);
+    let cursor_row = viewport_start
+        .saturating_add(usize::from(terminal.cursor_y()?))
+        .min(total_rows.saturating_sub(1));
+    let mut last_content_row = None;
+    for row in (viewport_start..total_rows).rev() {
+        if !ghostty_screen_row(terminal, cols, row as u32)?
+            .trim()
+            .is_empty()
+        {
+            last_content_row = Some(row);
+            break;
+        }
+    }
+    let end = last_content_row
+        .map(|row| row.max(cursor_row))
+        .unwrap_or_else(|| total_rows.saturating_sub(1));
     let start = end.saturating_add(1).saturating_sub(lines);
     Ok(Some((start, end, cols)))
 }
@@ -5240,6 +5317,30 @@ mod tests {
             .extract_selection(&selection)
             .expect("selection should extract text");
         assert_eq!(text, "000003\n000004\n000005");
+    }
+
+    #[test]
+    fn recent_reads_include_viewport_before_scrollback_exists() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal =
+            crate::ghostty::Terminal::new(20, 20, crate::config::DEFAULT_SCROLLBACK_LIMIT_BYTES)
+                .unwrap();
+        terminal.write(b"hello123");
+        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
+
+        assert_eq!(pane.recent_text(3), "hello123\n");
+        assert_eq!(pane.recent_unwrapped_text(3), "hello123");
+    }
+
+    #[test]
+    fn alternate_screen_recent_reads_keep_physical_row_ranges() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(20, 20, 100).unwrap();
+        terminal.write(b"\x1b[?1049hhello123");
+        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
+
+        assert_eq!(pane.recent_text(3), "");
+        assert_eq!(pane.recent_unwrapped_text(3), "");
     }
 
     #[test]
