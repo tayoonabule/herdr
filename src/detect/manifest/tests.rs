@@ -739,6 +739,108 @@ fn claude_blocker_with_background_shell_remains_blocked() {
 }
 
 #[test]
+fn claude_bash_prompt_with_dont_ask_again_option_matches_bash_rule() {
+    // Captured from a Bash approval prompt at its resting cursor position. The
+    // "don't ask again" choice pushes No to option 3, so the only cursor-free
+    // option line is one bash_permission_prompt used not to cover, which let
+    // the narrower generic_permission_prompt claim the prompt instead (#2650).
+    let screen = concat!(
+        "────────────────────────────────────────────────────────────────
+",
+        " Bash command
+
+",
+        "   curl -sS -o /tmp/probe.html https://example.com
+",
+        "   Download example.com to /tmp/probe.html
+
+",
+        " This command requires approval
+
+",
+        " Do you want to proceed?
+",
+        " ❯ 1. Yes
+",
+        "   2. Yes, and don't ask again for: curl *
+",
+        "   3. No
+
+",
+        " Esc to cancel · Tab to amend · ctrl+e to explain
+",
+    );
+    let result = osc_explain(Agent::Claude, screen, "", "");
+
+    assert_eq!(result.state, AgentState::Blocked);
+    assert_eq!(
+        result.matched_rule.as_ref().map(|rule| rule.id.as_str()),
+        Some("bash_permission_prompt")
+    );
+    assert!(result.visible_blocker);
+}
+
+#[test]
+fn claude_permission_prompt_matches_at_every_cursor_position() {
+    // The selected option carries "❯", so no option branch may assume its line
+    // is cursor-free. Walk the cursor across both option layouts.
+    let layouts: [&[&str]; 2] = [
+        &[" ❯ 1. Yes", "   2. No"],
+        &[
+            " ❯ 1. Yes",
+            "   2. Yes, and don't ask again for: curl *",
+            "   3. No",
+        ],
+    ];
+
+    for layout in layouts {
+        for selected in 0..layout.len() {
+            let options: Vec<String> = layout
+                .iter()
+                .enumerate()
+                .map(|(index, line)| {
+                    let bare = line.trim_start().trim_start_matches('❯').trim_start();
+                    if index == selected {
+                        format!(" ❯ {bare}")
+                    } else {
+                        format!("   {bare}")
+                    }
+                })
+                .collect();
+            let screen = format!(
+                concat!(
+                    "────────────────────────────────────────────────────────────────
+",
+                    " Bash command
+
+",
+                    "   curl -sS https://example.com
+
+",
+                    " Do you want to proceed?
+",
+                    "{}
+
+",
+                    " Esc to cancel · Tab to amend · ctrl+e to explain
+",
+                ),
+                options.join("\n"),
+            );
+            let result = osc_explain(Agent::Claude, &screen, "", "");
+
+            assert_eq!(
+                result.matched_rule.as_ref().map(|rule| rule.id.as_str()),
+                Some("bash_permission_prompt"),
+                "{options:?} selected={selected}"
+            );
+            assert_eq!(result.state, AgentState::Blocked, "selected={selected}");
+            assert!(result.visible_blocker, "selected={selected}");
+        }
+    }
+}
+
+#[test]
 fn claude_osc_title_braille_prefix_is_working() {
     // "⠂" is U+2802, in the braille block U+2800-U+28FF
     let result = osc_explain(Agent::Claude, "", "⠂ project", "");
@@ -1007,6 +1109,47 @@ fn codex_trust_directory_requires_live_top_region() {
         Some("trust_directory")
     );
     assert!(!result.visible_blocker);
+}
+
+#[test]
+fn codex_startup_update_requires_complete_live_chooser() {
+    let chooser = "Update available! 0.153.0 -> 9.8.7\n\
+        Run bun add -g @openai/codex to update.\n\n\
+        › 1. Update now\n\
+          2. Skip until next version\n\n\
+        Press enter to continue   \n";
+    let wrapped = "✨ Update available! 0.153.0\n\n\
+        Release notes: https://example\n\n\
+        › 1. Update now (runs `npm\n\
+             install -g\n\
+             @openai/codex`)\n\
+          2. Skip\n\
+          3. Skip until next\n\
+             version\n\n\
+        Press enter to continue\n";
+
+    for screen in [chooser, wrapped] {
+        let result = osc_explain(Agent::Codex, screen, "project", "");
+        assert_eq!(result.state, AgentState::Blocked);
+        assert_eq!(
+            result.matched_rule.as_ref().map(|rule| rule.id.as_str()),
+            Some("startup_update")
+        );
+        assert!(result.visible_blocker);
+    }
+
+    for screen in [
+        chooser.replace("Update now", "Install"),
+        format!("{wrapped}\n› Ask Codex to do anything\n"),
+    ] {
+        let result = osc_explain(Agent::Codex, &screen, "project", "");
+        assert_eq!(result.state, AgentState::Idle);
+        assert_ne!(
+            result.matched_rule.as_ref().map(|rule| rule.id.as_str()),
+            Some("startup_update")
+        );
+        assert!(!result.visible_blocker);
+    }
 }
 
 #[test]
