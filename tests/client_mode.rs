@@ -344,6 +344,11 @@ fn direct_attach_initial_mouse_capture_follows_config() {
         "direct attach must enable host bracketed paste; output: {:?}",
         read_output(&output)
     );
+    assert!(
+        !read_output(&output).contains("\x1b[?u"),
+        "direct attach must not query rendered-client keyboard state; output: {:?}",
+        read_output(&output)
+    );
 
     let restore_watermark = output_len(&output);
     attach
@@ -709,6 +714,73 @@ fn read_output(output: &SharedOutput) -> String {
         .clone()
 }
 
+#[test]
+fn sigwinch_refreshes_host_palette_without_resizing() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+    let server = spawn_server_with_config(
+        &config_home,
+        &runtime_dir,
+        &api_socket,
+        &client_socket,
+        "onboarding = false\n[theme]\nname = \"terminal\"\n",
+    );
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    wait_for_socket(&client_socket, Duration::from_secs(10));
+    let client = spawn_client_shell_process(&config_home, &runtime_dir, &api_socket);
+    let master = client._master.as_ref().expect("client PTY");
+    let output = spawn_pty_drain(master.try_clone_reader().unwrap());
+    let mut writer = master.take_writer().unwrap();
+    let queries = "\x1b]10;?\x1b\\\x1b]11;?\x1b\\";
+    assert!(
+        wait_until(Duration::from_secs(5), Duration::from_millis(25), || {
+            read_output(&output).contains(queries)
+        }),
+        "client should query the initial palette: {:?}",
+        read_output(&output)
+    );
+
+    // Complete the startup query with a light palette. No appearance notification
+    // is sent: this models a terminal whose colors are changed directly by OSC.
+    let mut light =
+        String::from("\x1b]10;rgb:0000/0000/0000\x1b\\\x1b]11;rgb:ffff/ffff/ffff\x1b\\");
+    for index in 0..=u8::MAX {
+        light.push_str(&format!("\x1b]4;{index};rgb:ffff/ffff/ffff\x1b\\"));
+    }
+    writer.write_all(light.as_bytes()).unwrap();
+    writer.flush().unwrap();
+    // Let startup settle and the resize watcher install its signal handler.
+    thread::sleep(Duration::from_millis(250));
+
+    for _ in 0..2 {
+        let watermark = output_len(&output);
+        assert_eq!(
+            unsafe { libc::kill(client.child.process_id().unwrap() as i32, libc::SIGWINCH) },
+            0
+        );
+        assert!(
+            wait_until(Duration::from_secs(5), Duration::from_millis(25), || {
+                let captured = read_output(&output);
+                let refreshed = &captured[watermark..];
+                refreshed.contains(queries) && refreshed.contains("\x1b]4;15;?\x1b\\")
+            }),
+            "SIGWINCH should query default colors and the ANSI palette without changing PTY size"
+        );
+        writer
+            .write_all(b"\x1b]10;rgb:eeee/eeee/eeee\x1b\\\x1b]11;rgb:1111/2222/3333\x1b\\")
+            .unwrap();
+        writer.flush().unwrap();
+    }
+
+    drop(writer);
+    drop(client);
+    cleanup_spawned_herdr(server, base);
+}
+
 /// Current captured byte length, used as a watermark so a test can search only
 /// the output emitted *after* a trigger. The teardown markers also appear in
 /// normal attach-phase output, so matching the whole buffer is meaningless.
@@ -719,7 +791,11 @@ fn output_len(output: &SharedOutput) -> usize {
 fn sidebar_row_click(screen: &str, label: &str) -> Vec<u8> {
     let sidebar_width = screen
         .lines()
-        .find_map(|line| line.chars().position(|character| character == '│'))
+        .find_map(|line| {
+            line.chars()
+                .position(|character| character == '│')
+                .filter(|column| *column > 0)
+        })
         .expect("visible sidebar boundary");
     let row = screen
         .lines()
@@ -732,6 +808,15 @@ fn sidebar_row_click(screen: &str, label: &str) -> Vec<u8> {
         .unwrap_or_else(|| panic!("sidebar row {label:?} is not visible: {screen}"))
         + 1;
     format!("\x1b[<0;7;{row}M\x1b[<0;7;{row}m").into_bytes()
+}
+
+#[test]
+fn sidebar_row_click_ignores_notice_borders() {
+    let screen = "┌─────────────────────────┐\n│● Endpoint unavailable   │\n└─────────────────────────┘\n   · local-returned      │\n";
+    assert_eq!(
+        sidebar_row_click(screen, "local-returned"),
+        b"\x1b[<0;7;4M\x1b[<0;7;4m"
+    );
 }
 
 #[test]
@@ -1087,6 +1172,58 @@ fn federated_client_starts_without_local_and_survives_its_restart() {
         "Local recovery must not steal selection: {}",
         screen_text()
     );
+    let local_pane = created["result"]["root_pane"]["pane_id"].as_str().unwrap();
+    send_pane_shell_command(
+        &api_socket,
+        local_pane,
+        "printf 'LOCAL_WHILE_REMOTE_STALLED\\n'",
+    );
+    {
+        struct ResumeBridge(libc::pid_t);
+        impl Drop for ResumeBridge {
+            fn drop(&mut self) {
+                unsafe { libc::kill(self.0, libc::SIGCONT) };
+            }
+        }
+        let bridge: libc::pid_t = fs::read_to_string(&bridge_pid)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(unsafe { libc::kill(bridge, libc::SIGSTOP) }, 0);
+        let _resume_bridge = ResumeBridge(bridge);
+        input
+            .write_all(&sidebar_row_click(&screen_text(), "local-returned"))
+            .unwrap();
+        assert!(
+            wait_until(Duration::from_secs(3), Duration::from_millis(20), || {
+                screen_text().contains("LOCAL_WHILE_REMOTE_STALLED")
+            }),
+            "one Local selection must not wait for the remote bridge: {}",
+            screen_text()
+        );
+        assert!(
+            wait_until(Duration::from_secs(3), Duration::from_millis(100), || {
+                if screen_text().contains("LOCAL_INPUT_WHILE_REMOTE_STALLED") {
+                    return true;
+                }
+                input
+                    .write_all(b"printf 'LOCAL_%s\\n' INPUT_WHILE_REMOTE_STALLED\r")
+                    .unwrap();
+                false
+            }),
+            "Local input must become usable while the remote bridge remains stopped"
+        );
+    }
+    input
+        .write_all(&sidebar_row_click(&screen_text(), "remote-ready"))
+        .unwrap();
+    assert!(wait_until(
+        Duration::from_secs(10),
+        Duration::from_millis(20),
+        || screen_text().contains("REMOTE_STILL_SELECTED")
+    ));
+
     let watermark = output_len(&output);
     remote_server.child.kill().unwrap();
     assert!(
@@ -1101,7 +1238,6 @@ fn federated_client_starts_without_local_and_survives_its_restart() {
         "losing the selected remote must keep host mouse reporting enabled"
     );
 
-    let local_pane = created["result"]["root_pane"]["pane_id"].as_str().unwrap();
     send_pane_shell_command(
         &api_socket,
         local_pane,
@@ -1727,10 +1863,7 @@ fn client_receives_pane_surface_after_pane_output() {
 }
 
 #[test]
-fn pane_spawn_cwd_fallback_in_server() {
-    // Pane spawn failure cwd fallback in server context.
-    // This test verifies that the server can start even with invalid
-    // session data pointing to non-existent directories.
+fn unavailable_restored_pane_keeps_saved_cwd_in_server() {
     let _lock = test_lock();
     let base = unique_test_dir();
     let config_home = base.join("config");
@@ -1785,12 +1918,11 @@ fn pane_spawn_cwd_fallback_in_server() {
     assert_eq!(pane["result"]["pane"]["workspace_id"], workspace_id);
     let cwd = pane["result"]["pane"]["cwd"]
         .as_str()
-        .expect("restored pane should report fallback cwd");
-    assert_ne!(cwd, missing_cwd);
-    assert!(
-        std::path::Path::new(cwd).exists(),
-        "fallback cwd should exist: {cwd}"
-    );
+        .expect("restored pane should retain saved cwd");
+    assert_eq!(cwd, missing_cwd);
+    assert!(pane["result"]["pane"]["restore_error"]
+        .as_str()
+        .is_some_and(|error| error.contains("directory")));
 
     let client_shell = spawn_client_shell_process(&config_home, &runtime_dir, &api_socket);
     let output = spawn_pty_drain(
@@ -1803,14 +1935,47 @@ fn pane_spawn_cwd_fallback_in_server() {
     );
     assert!(
         wait_until(Duration::from_secs(8), Duration::from_millis(20), || {
-            read_output(&output).contains("missing-cwd")
+            let screen = read_output(&output);
+            screen.contains("missing-cwd") && screen.contains("unavailable")
         }),
-        "client shell should render the restored session; output: {:?}",
+        "client shell should render the unavailable pane; output: {:?}",
         read_output(&output)
     );
-
+    drop(client_shell);
+    let stopped = send_json_request(
+        &api_socket,
+        r#"{"id":"stop","method":"server.stop","params":{}}"#,
+    );
+    assert!(stopped.get("error").is_none(), "{stopped}");
+    let mut spawned = spawned;
+    assert!(wait_until(
+        Duration::from_secs(10),
+        Duration::from_millis(20),
+        || { spawned.child.try_wait().unwrap().is_some() }
+    ));
     drop(spawned);
-    cleanup_spawned_herdr(client_shell, base);
+
+    fs::create_dir(missing_cwd).unwrap();
+    let restarted = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    let recovered = send_json_request(
+        &api_socket,
+        &format!(r#"{{"id":"recovered","method":"pane.get","params":{{"pane_id":"{pane_id}"}}}}"#),
+    );
+    assert_eq!(
+        std::fs::canonicalize(recovered["result"]["pane"]["cwd"].as_str().unwrap()).unwrap(),
+        std::fs::canonicalize(missing_cwd).unwrap()
+    );
+    assert!(recovered["result"]["pane"]["restore_error"].is_null());
+    let sent = send_json_request(
+        &api_socket,
+        &serde_json::json!({"id": "type", "method": "pane.send_text", "params": {
+            "pane_id": pane_id, "text": "printf 'RESTORE_RETRY_OK\\n'\n"
+        }})
+        .to_string(),
+    );
+    assert!(sent.get("error").is_none(), "{sent}");
+    cleanup_spawned_herdr(restarted, base);
 }
 
 #[test]

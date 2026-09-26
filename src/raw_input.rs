@@ -150,6 +150,7 @@ pub(crate) struct RawInputByteFramer {
     host_color_scheme_change_tracking: bool,
     host_appearance_query_on_focus: bool,
     split_coalesced_escape: bool,
+    host_escape_disambiguation_active: bool,
 }
 
 const HOST_COLOR_QUERY_REPLIES: u16 = 258;
@@ -178,8 +179,11 @@ impl RawInputByteFramer {
 
     /// Hold a lone trailing ESC for one idle flush so an OSC 10/11 reply split
     /// at its ESC introducer stitches back together instead of leaking (#549).
+    /// Overlapping queries each add their own replies to the window.
     pub(crate) fn host_color_query_sent(&mut self) {
-        self.host_color_replies_awaited = HOST_COLOR_QUERY_REPLIES;
+        self.host_color_replies_awaited = self
+            .host_color_replies_awaited
+            .saturating_add(HOST_COLOR_QUERY_REPLIES);
         self.held_pending_host_reply_esc = false;
     }
 
@@ -218,9 +222,19 @@ impl RawInputByteFramer {
         !self.buffer.is_empty()
     }
 
+    #[cfg(any(unix, test))]
+    pub(crate) fn set_host_escape_disambiguation_active(&mut self, active: bool) {
+        self.host_escape_disambiguation_active = active;
+    }
+
     #[cfg(unix)]
     pub(crate) fn has_pending_lone_escape(&self) -> bool {
         self.buffer.as_slice() == [ESC]
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn has_pending_csi_introducer(&self) -> bool {
+        self.buffer.as_slice() == b"\x1b["
     }
 
     #[cfg(unix)]
@@ -264,6 +278,16 @@ impl RawInputByteFramer {
         }
 
         if self.buffer.is_empty() {
+            return chunks;
+        }
+
+        if self.host_escape_disambiguation_active
+            && starts_with_bounded_incomplete_escape_sequence(&self.buffer)
+        {
+            tracing::trace!(
+                len = self.buffer.len(),
+                "holding incomplete host escape sequence with disambiguation active"
+            );
             return chunks;
         }
 
@@ -468,6 +492,15 @@ impl RawInputByteFramer {
 
             if self.split_coalesced_escape && self.buffer.starts_with(b"\x1b\x1b") {
                 chunks.push(vec![ESC]);
+                self.buffer.drain(..1);
+                continue;
+            }
+
+            if self.host_escape_disambiguation_active
+                && self.buffer.first() == Some(&ESC)
+                && self.buffer.len() > 1
+                && !starts_with_known_escape_introducer(&self.buffer)
+            {
                 self.buffer.drain(..1);
                 continue;
             }
@@ -829,6 +862,25 @@ fn starts_with_incomplete_sgr_mouse_sequence(buffer: &[u8]) -> bool {
         && buffer[3..]
             .iter()
             .all(|byte| byte.is_ascii_digit() || *byte == b';')
+}
+
+fn starts_with_known_escape_introducer(buffer: &[u8]) -> bool {
+    buffer
+        .get(1)
+        .is_some_and(|byte| matches!(*byte, b'[' | b'O' | b']' | b'P' | b'_' | b'^' | b'X' | ESC))
+}
+
+fn starts_with_bounded_incomplete_escape_sequence(buffer: &[u8]) -> bool {
+    if buffer.len() >= MAX_DISCARDED_CONTROL_TAIL_BYTES {
+        return false;
+    }
+    if buffer == [ESC] || buffer == b"\x1bO" {
+        return true;
+    }
+    let Some(body) = buffer.strip_prefix(b"\x1b[") else {
+        return false;
+    };
+    body.iter().all(|byte| matches!(*byte, 0x20..=0x3f))
 }
 
 #[cfg(any(unix, windows, test))]
@@ -2017,6 +2069,71 @@ mod tests {
     }
 
     #[test]
+    fn confirmed_host_disambiguation_retains_split_sgr_mouse_without_escape() {
+        for (prefix, tail) in [
+            (b"\x1b".as_slice(), b"[<0;5;5M".as_slice()),
+            (b"\x1b[".as_slice(), b"<0;5;5M".as_slice()),
+            (b"\x1b[<0;".as_slice(), b"5;5M".as_slice()),
+        ] {
+            let mut framer = RawInputFramer::default();
+            framer
+                .byte_framer
+                .set_host_escape_disambiguation_active(true);
+
+            assert!(framer.push(prefix).is_empty());
+            assert!(framer.flush_timeout().is_empty());
+            assert!(framer.flush_timeout().is_empty());
+            let events = framer.push(tail);
+
+            assert!(matches!(
+                events.as_slice(),
+                [RawInputEvent::Mouse(MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: 4,
+                    row: 4,
+                    ..
+                })]
+            ));
+        }
+    }
+
+    #[test]
+    fn confirmed_host_disambiguation_drops_stale_escape_before_plain_input() {
+        let mut framer = RawInputFramer::default();
+        framer
+            .byte_framer
+            .set_host_escape_disambiguation_active(true);
+
+        assert!(framer.push(b"\x1b").is_empty());
+        assert!(framer.flush_timeout().is_empty());
+        let events = framer.push(b"x");
+
+        assert_eq!(events.len(), 1);
+        assert_raw_key(
+            events.into_iter().next().unwrap(),
+            KeyCode::Char('x'),
+            KeyModifiers::empty(),
+        );
+    }
+
+    #[test]
+    fn confirmed_host_disambiguation_keeps_kitty_escape_immediate() {
+        let mut framer = RawInputFramer::default();
+        framer
+            .byte_framer
+            .set_host_escape_disambiguation_active(true);
+
+        let events = framer.push(b"\x1b[27u");
+
+        assert_eq!(events.len(), 1);
+        assert_raw_key(
+            events.into_iter().next().unwrap(),
+            KeyCode::Esc,
+            KeyModifiers::empty(),
+        );
+    }
+
+    #[test]
     fn sgr_mouse_tail_after_lone_escape_timeout_is_discarded() {
         let mut framer = RawInputFramer::default();
 
@@ -2744,5 +2861,35 @@ mod tests {
         // Window closed: a later lone Escape flushes immediately.
         assert!(framer.push(b"\x1b").is_empty());
         assert_eq!(framer.flush_timeout(), vec![b"\x1b".to_vec()]);
+    }
+
+    #[test]
+    fn overlapping_host_color_queries_keep_holding_split_reply_escape() {
+        use std::fmt::Write as _;
+
+        let mut framer = RawInputByteFramer::default();
+        framer.host_color_query_sent();
+        framer.host_color_query_sent();
+        let mut first_batch =
+            String::from("\x1b]10;rgb:6565/7b7b/8383\x1b\\\x1b]11;rgb:2424/2727/3a3a\x1b\\");
+        for index in 0..=u8::MAX {
+            let _ = write!(first_batch, "\x1b]4;{index};rgb:1111/2222/3333\x1b\\");
+        }
+        assert_eq!(framer.push(first_batch.as_bytes()).len(), 258);
+
+        // The second batch is still outstanding, so its first reply split at ESC
+        // must not leak into the pane as an Escape key.
+        assert!(framer.push(b"\x1b").is_empty());
+        assert!(framer.flush_timeout().is_empty());
+        let chunks = framer.push(b"]10;rgb:eeee/eeee/eeee\x1b\\");
+        assert_eq!(chunks.len(), 1);
+        let (event, _) = extract_one_event(&chunks[0]).unwrap();
+        assert!(matches!(
+            event,
+            RawInputEvent::HostDefaultColor {
+                kind: DefaultColorKind::Foreground,
+                ..
+            }
+        ));
     }
 }
