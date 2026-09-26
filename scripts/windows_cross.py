@@ -1,4 +1,4 @@
-"""One-time Windows SDK setup and Windows target linting from Unix hosts."""
+"""Windows SDK setup and cross-linting; macOS needs an SDK discoverable by xcrun."""
 
 import argparse
 import os
@@ -47,6 +47,36 @@ def libc_path() -> Path:
     return path.resolve()
 
 
+def ensure_macos_host_libsystem(config: Path) -> None:
+    if sys.platform != "darwin":
+        return
+    # Zig 0.16 passes the build-wide Windows --libc config to native Zig
+    # generators too. They still need macOS libSystem to link. Keep the Windows
+    # headers and libraries intact, and expose only the host SDK library path
+    # at the sysroot location Zig derives from this xwin installation.
+    sdk = Path(subprocess.check_output(
+        ["xcrun", "--sdk", "macosx", "--show-sdk-path"], text=True,
+    ).strip())
+    host_lib = sdk / "usr/lib"
+    if not (host_lib / "libSystem.tbd").is_file():
+        raise ValueError(f"macOS SDK is missing libSystem.tbd: {host_lib}")
+    link = config.parent / "usr/lib"
+    if link.is_symlink():
+        if link.resolve() == host_lib.resolve():
+            return
+        raise ValueError(f"refusing to replace existing SDK symlink: {link}")
+    if link.exists():
+        raise ValueError(f"refusing to replace existing Windows SDK path: {link}")
+    link.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        link.symlink_to(host_lib, target_is_directory=True)
+    except FileExistsError:
+        # Concurrent worktrees share this SDK. Accept the same link if another
+        # lint process created it first, but never replace an unknown path.
+        if not link.is_symlink() or link.resolve() != host_lib.resolve():
+            raise ValueError(f"refusing to replace existing Windows SDK path: {link}") from None
+
+
 def setup(accept_license: bool) -> None:
     if not shutil.which("xwin"):
         raise ValueError("Install xwin first: cargo install xwin --locked")
@@ -70,7 +100,9 @@ def setup(accept_license: bool) -> None:
 
 
 def lint() -> None:
-    env = {**os.environ, LIBC_ENV: str(libc_path()), "LIBGHOSTTY_VT_SIMD": "false"}
+    config = libc_path()
+    ensure_macos_host_libsystem(config)
+    env = {**os.environ, LIBC_ENV: str(config), "LIBGHOSTTY_VT_SIMD": "false"}
     subprocess.run(["rustup", "target", "add", TARGET], check=True)
     subprocess.run(
         ["cargo", "clippy", "--bin", "herdr", "--locked", "--target", TARGET, "--", "-D", "warnings"],

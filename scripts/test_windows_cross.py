@@ -53,15 +53,82 @@ class WindowsCrossTests(unittest.TestCase):
 
     def test_lint_passes_sdk_to_cargo_without_changing_parent_environment(self):
         with patch.object(windows_cross, "libc_path", return_value=Path("/sdk/libc.txt")), \
+                patch.object(windows_cross, "ensure_macos_host_libsystem") as host_sdk, \
                 patch.dict(os.environ, {"KEEP_ME": "yes"}, clear=True), \
                 patch.object(windows_cross.subprocess, "run") as run:
             windows_cross.lint()
+            host_sdk.assert_called_once_with(Path("/sdk/libc.txt"))
             self.assertEqual(run.call_count, 2)
             cargo = run.call_args
             self.assertEqual(cargo.args[0][:2], ["cargo", "clippy"])
             self.assertEqual(cargo.kwargs["env"][windows_cross.LIBC_ENV], str(Path("/sdk/libc.txt")))
             self.assertEqual(cargo.kwargs["env"]["KEEP_ME"], "yes")
             self.assertNotIn(windows_cross.LIBC_ENV, os.environ)
+
+    def test_macos_host_sdk_link_is_safe_and_idempotent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sdk = root / "MacOSX.sdk"
+            host_lib = sdk / "usr/lib"
+            host_lib.mkdir(parents=True)
+            (host_lib / "libSystem.tbd").touch()
+            config = root / "windows/libc.txt"
+            config.parent.mkdir()
+            with patch.object(windows_cross.sys, "platform", "darwin"), \
+                    patch.object(windows_cross.subprocess, "check_output", return_value=str(sdk)):
+                windows_cross.ensure_macos_host_libsystem(config)
+                link = config.parent / "usr/lib"
+                self.assertTrue(link.is_symlink())
+                self.assertEqual(link.resolve(), host_lib.resolve())
+                windows_cross.ensure_macos_host_libsystem(config)
+                self.assertEqual(link.resolve(), host_lib.resolve())
+
+                link.unlink()
+                link.mkdir()
+                with self.assertRaisesRegex(ValueError, "refusing to replace"):
+                    windows_cross.ensure_macos_host_libsystem(config)
+                self.assertTrue(link.is_dir())
+                self.assertFalse(link.is_symlink())
+
+                link.rmdir()
+                other = root / "other"
+                other.mkdir()
+                link.symlink_to(other, target_is_directory=True)
+                with self.assertRaisesRegex(ValueError, "existing SDK symlink"):
+                    windows_cross.ensure_macos_host_libsystem(config)
+                self.assertEqual(link.resolve(), other.resolve())
+
+    def test_concurrent_macos_sdk_link_creation_accepts_same_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sdk = root / "MacOSX.sdk"
+            host_lib = sdk / "usr/lib"
+            host_lib.mkdir(parents=True)
+            (host_lib / "libSystem.tbd").touch()
+            config = root / "windows/libc.txt"
+            original_symlink_to = Path.symlink_to
+
+            def competing_lint(path, target, target_is_directory=False):
+                original_symlink_to(path, target, target_is_directory=target_is_directory)
+                raise FileExistsError(path)
+
+            with patch.object(windows_cross.sys, "platform", "darwin"), \
+                    patch.object(windows_cross.subprocess, "check_output", return_value=str(sdk)), \
+                    patch.object(Path, "symlink_to", competing_lint):
+                windows_cross.ensure_macos_host_libsystem(config)
+            self.assertEqual((config.parent / "usr/lib").resolve(), host_lib.resolve())
+
+    def test_missing_macos_libsystem_does_not_create_sdk_link(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sdk = root / "MacOSX.sdk"
+            (sdk / "usr/lib").mkdir(parents=True)
+            config = root / "windows/libc.txt"
+            with patch.object(windows_cross.sys, "platform", "darwin"), \
+                    patch.object(windows_cross.subprocess, "check_output", return_value=str(sdk)):
+                with self.assertRaisesRegex(ValueError, "missing libSystem"):
+                    windows_cross.ensure_macos_host_libsystem(config)
+                self.assertFalse((config.parent / "usr/lib").exists())
 
     def test_license_acceptance_is_only_forwarded_when_explicit(self):
         with tempfile.TemporaryDirectory() as directory:
