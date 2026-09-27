@@ -151,6 +151,8 @@ pub(crate) struct RawInputByteFramer {
     host_appearance_query_on_focus: bool,
     split_coalesced_escape: bool,
     host_escape_disambiguation_active: bool,
+    /// An ESC that sat alone in the buffer across a push/flush (stale, not an Alt prefix).
+    escape_held_alone: bool,
 }
 
 const HOST_COLOR_QUERY_REPLIES: u16 = 258;
@@ -173,6 +175,7 @@ impl RawInputByteFramer {
     }
 
     pub(crate) fn push(&mut self, data: &[u8]) -> Vec<Vec<u8>> {
+        self.escape_held_alone = self.buffer.as_slice() == [ESC];
         self.buffer.extend_from_slice(data);
         self.drain_available_chunks()
     }
@@ -500,7 +503,9 @@ impl RawInputByteFramer {
                 && self.buffer.first() == Some(&ESC)
                 && self.buffer.len() > 1
                 && !starts_with_known_escape_introducer(&self.buffer)
+                && !(starts_with_alt_chord(&self.buffer) && !self.escape_held_alone)
             {
+                self.escape_held_alone = false;
                 self.buffer.drain(..1);
                 continue;
             }
@@ -868,6 +873,13 @@ fn starts_with_known_escape_introducer(buffer: &[u8]) -> bool {
     buffer
         .get(1)
         .is_some_and(|byte| matches!(*byte, b'[' | b'O' | b']' | b'P' | b'_' | b'^' | b'X' | ESC))
+}
+
+/// `ESC <printable>` in one read is an Alt/Meta chord, not a stale Escape.
+/// Kitty-capable hosts such as Ghostty/cmux still send macOS Option+Left/Right
+/// as `ESC b` / `ESC f`, so dropping the ESC turns word motion into letters.
+fn starts_with_alt_chord(buffer: &[u8]) -> bool {
+    buffer.get(1).is_some_and(|byte| (0x20..0x7f).contains(byte))
 }
 
 fn starts_with_bounded_incomplete_escape_sequence(buffer: &[u8]) -> bool {
@@ -2094,6 +2106,25 @@ mod tests {
                     ..
                 })]
             ));
+        }
+    }
+
+    #[test]
+    fn confirmed_host_disambiguation_keeps_alt_letter_chords() {
+        // cmux/Ghostty send macOS Option+Left/Right as ESC b / ESC f in one read.
+        let mut framer = RawInputFramer::default();
+        framer
+            .byte_framer
+            .set_host_escape_disambiguation_active(true);
+
+        for (bytes, ch) in [(b"\x1bb", 'b'), (b"\x1bf", 'f')] {
+            let events = framer.push(bytes);
+            assert_eq!(events.len(), 1);
+            assert_raw_key(
+                events.into_iter().next().unwrap(),
+                KeyCode::Char(ch),
+                KeyModifiers::ALT,
+            );
         }
     }
 
