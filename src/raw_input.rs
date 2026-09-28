@@ -664,7 +664,7 @@ impl RawInputByteFramer {
                 && self.buffer.first() == Some(&ESC)
                 && self.buffer.len() > 1
                 && !starts_with_known_escape_introducer(&self.buffer)
-                && !(starts_with_alt_chord(&self.buffer) && !self.escape_held_alone)
+                && (self.escape_held_alone || !starts_with_alt_chord(&self.buffer))
             {
                 self.escape_held_alone = false;
                 self.buffer.drain(..1);
