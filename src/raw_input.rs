@@ -1087,7 +1087,9 @@ fn starts_with_known_escape_introducer(buffer: &[u8]) -> bool {
 /// Kitty-capable hosts such as Ghostty/cmux still send macOS Option+Left/Right
 /// as `ESC b` / `ESC f`, so dropping the ESC turns word motion into letters.
 fn starts_with_alt_chord(buffer: &[u8]) -> bool {
-    buffer.get(1).is_some_and(|byte| (0x20..0x7f).contains(byte))
+    buffer
+        .get(1)
+        .is_some_and(|byte| (0x20..0x7f).contains(byte))
 }
 
 fn starts_with_bounded_incomplete_escape_sequence(buffer: &[u8]) -> bool {
