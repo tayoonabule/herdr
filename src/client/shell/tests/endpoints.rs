@@ -73,6 +73,105 @@ fn state_with_remote() -> (ClientShellState, ClientEndpointId) {
     (state, endpoint_id)
 }
 
+#[cfg(windows)]
+#[test]
+fn system_notification_clicks_keep_endpoint_and_boot_identity() {
+    let (mut state, remote) = state_with_remote();
+    state.config.toast_delivery = crate::config::ToastDelivery::System;
+    state.config.toast_delay_seconds = 0;
+    state.outer_focused = Some(false);
+    for endpoint_id in [ClientEndpointId::Local, remote.clone()] {
+        let (effects, _) = state.receive_notification(
+            &endpoint_id,
+            SemanticNotification {
+                kind: SemanticNotificationKind::Custom,
+                title: "test".into(),
+                body: None,
+                sound: None,
+                agent: None,
+                workspace_id: Some("ws_1".into()),
+                tab_id: Some("tab_1".into()),
+                pane_id: Some("pane_1".into()),
+                position: None,
+            },
+            std::time::Instant::now(),
+        );
+        let [ClientShellNotificationEffect::System {
+            target: Some(target),
+            ..
+        }] = effects.as_slice()
+        else {
+            panic!("system effect must retain notification target");
+        };
+        let target = target.clone();
+        assert_eq!(target.endpoint_id, endpoint_id);
+        let outcome = state.activate_system_notification(target.clone());
+        assert!(
+            !outcome.actions.is_empty(),
+            "a current target must navigate"
+        );
+        if endpoint_id == remote {
+            assert!(
+                matches!(&outcome.actions[..], [ClientShellAction::ActivateEndpoint {
+                endpoint_id: id, target: Some(ClientEndpointFocusTarget::Notification { pane_id, boot_id }),
+            }] if id == &remote && pane_id == "pane_1" && boot_id == "remote-boot")
+            );
+        }
+        state.set_endpoint_status(&endpoint_id, ClientEndpointStatus::Reconnecting);
+        assert!(state
+            .activate_system_notification(target.clone())
+            .actions
+            .is_empty());
+        state.set_endpoint_status(&endpoint_id, ClientEndpointStatus::Online);
+        assert!(
+            !state
+                .activate_system_notification(target.clone())
+                .actions
+                .is_empty(),
+            "same-boot reconnect remains valid"
+        );
+        let endpoint = state
+            .endpoints
+            .iter_mut()
+            .find(|endpoint| endpoint.endpoint_id == endpoint_id)
+            .unwrap();
+        let snapshot = endpoint.snapshot.as_mut().unwrap();
+        snapshot.boot_id = "replacement-boot".into();
+        assert!(
+            state
+                .activate_system_notification(target.clone())
+                .actions
+                .is_empty(),
+            "same pane ID from another boot must not navigate"
+        );
+        let endpoint = state
+            .endpoints
+            .iter_mut()
+            .find(|endpoint| endpoint.endpoint_id == endpoint_id)
+            .unwrap();
+        let snapshot = endpoint.snapshot.as_mut().unwrap();
+        snapshot.boot_id = target.boot_id.clone();
+        snapshot.panes.clear();
+        assert!(
+            state
+                .activate_system_notification(target.clone())
+                .actions
+                .is_empty(),
+            "closed pane must not navigate"
+        );
+        if endpoint_id == remote {
+            state.set_endpoint_catalog(&[]);
+            assert!(
+                state
+                    .activate_system_notification(target)
+                    .actions
+                    .is_empty(),
+                "removed profile must not navigate"
+            );
+        }
+    }
+}
+
 #[test]
 fn machine_diagnostic_badge_reopens_notice_without_collapsing_machine() {
     let (mut state, id) = state_with_remote();
@@ -146,6 +245,54 @@ fn state_with_scrollable_agents() -> (ClientShellState, ClientEndpointId) {
     state.compose(100, 28).unwrap();
     assert_eq!(state.agent_scroll, 6);
     (state, remote)
+}
+
+/// Checks that the visible toggle wins overlapping scrollbar clicks and can reopen
+/// the sidebar, for both endpoint layouts and both ends of the overflowing list.
+#[test]
+fn sidebar_toggle_remains_clickable_with_overflowing_agents() {
+    for saved_machine in [false, true] {
+        for scroll_to_bottom in [false, true] {
+            let (mut state, _) = state_with_scrollable_agents();
+            if !saved_machine {
+                state.set_endpoint_catalog(&[]);
+            }
+            state.agent_scroll = if scroll_to_bottom { usize::MAX } else { 0 };
+            let frame = state.compose(100, 28).expect("overflowing agent panel");
+            assert!(!state.hits.agent_scrollbar.is_empty());
+            let scroll = state.agent_scroll;
+
+            let toggle = state.hits.sidebar_toggle;
+            let buffer = frame.to_ratatui_buffer().expect("sidebar buffer");
+            assert_eq!(buffer[(toggle.x, toggle.y)].symbol(), "«");
+            let outcome = state.handle_raw_events(vec![RawInputEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: toggle.x,
+                row: toggle.y,
+                modifiers: KeyModifiers::NONE,
+            })]);
+            assert!(
+                state.sidebar_collapsed,
+                "collapse with saved_machine={saved_machine}, scroll_to_bottom={scroll_to_bottom}"
+            );
+            assert!(state.sidebar_collapsed_manual);
+            assert!(outcome.repaint && outcome.resize);
+            assert_eq!(state.agent_scroll, scroll);
+            assert!(state.chrome_drag.is_none());
+
+            state.compose(100, 28).expect("collapsed sidebar");
+            let toggle = state.hits.sidebar_toggle;
+            let outcome = state.handle_raw_events(vec![RawInputEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: toggle.x,
+                row: toggle.y,
+                modifiers: KeyModifiers::NONE,
+            })]);
+            assert!(!state.sidebar_collapsed);
+            assert!(outcome.repaint && outcome.resize);
+            assert!(state.chrome_drag.is_none());
+        }
+    }
 }
 
 #[test]

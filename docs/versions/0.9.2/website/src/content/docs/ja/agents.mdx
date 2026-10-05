@@ -48,8 +48,9 @@ Herdr はこれらのエージェントを認識し、画面の表示から状�
 これらのエージェントは自分の状態を Herdr に報告します。インストールするものはありません。Herdr のペインで実行するだけです。
 
 <ul class="agent-logos">
-  <li><a href="https://github.com/charmbracelet/crush"><span class="agent-logo" style={{ '--logo': "url('/assets/agent-icons/crush.svg')" }} aria-hidden="true"></span>Crush</a></li>
   <li><a href="https://commandcode.ai"><span class="agent-logo" style={{ '--logo': "url('/assets/agent-icons/command-code.svg')" }} aria-hidden="true"></span>Command Code</a></li>
+  <li><a href="https://github.com/charmbracelet/crush"><span class="agent-logo" style={{ '--logo': "url('/assets/agent-icons/crush.svg')" }} aria-hidden="true"></span>Crush</a></li>
+  <li><a href="https://kiro.dev/cli/"><span class="agent-logo" style={{ '--logo': "url('/assets/agent-icons/kiro-mask.svg')" }} aria-hidden="true"></span>Kiro CLI</a></li>
   <li><a href="https://dev.meta.ai/products/muse-code"><span class="agent-logo" style={{ '--logo': "url('/assets/agent-icons/muse-code.svg')" }} aria-hidden="true"></span>Muse Code</a></li>
   <li><a href="https://github.com/PrimeIntellect-ai/prime-agent"><span class="agent-logo" style={{ '--logo': "url('/assets/agent-icons/prime-agent.svg')" }} aria-hidden="true"></span>Prime Agent</a></li>
 </ul>
@@ -76,7 +77,7 @@ Linux と macOS では、ホストから見えるラッパーが実際のエー�
 
 それら Codex 以外のエージェントでは、見慣れない新しいプロンプトが、Herdr がその画面の形を学習するまで、最初は `blocked` ではなく `idle` と表示されることがあります。誤分類の影響は表示上の状態と wait だけです。これによって Herdr が入力を送ったり破壊的な操作をしたりすることはありません。
 
-Codex では、表示中のスピナーや稼働中のアクティビティタイマーから `working` を、表示中の承認プロンプトから `blocked` を判定できます。通常のタイトルやコンポーザー、スピナーがないことだけでは、ターンの終了を判定できません。そのため、Codex は応答後も `unknown` のままになることがあり、`idle` または完了を待つ処理はタイムアウトする場合があります。管理対象の起動では、初期コンポーザーをプロンプト受付可能になったかの判定にのみ使います。この観測によってターン状態は変わりません。
+Codex では、表示中のスピナーや稼働中のアクティビティタイマーから `working` を、表示中の承認プロンプトから `blocked` を判定できます。Codex のターミナルタイトルにスピナーが表示されていない場合、Herdr は `idle` と報告します。Codex が `unknown` のままになるのは、Codex がターミナルタイトルを設定していない場合など、どのルールにもマッチしないときだけです。その場合、`idle` または完了を待つ処理はタイムアウトすることがあります。管理対象の起動では、初期コンポーザーをプロンプト受付可能になったかの判定にのみ使います。この観測によってターン状態は変わりません。
 
 ## 検出マニフェスト
 

@@ -15,6 +15,121 @@ use std::{
 
 mod clipboard_image;
 mod config_backup;
+mod notifications;
+pub(crate) use notifications::{
+    foreground_desktop_notification_host, maybe_activate_desktop_notification,
+    show_actionable_desktop_notification, show_desktop_notification,
+};
+
+static ALLOW_UNELEVATED_CLIENTS: OnceLock<bool> = OnceLock::new();
+
+pub(crate) fn allow_unelevated_clients() {
+    let _ = ALLOW_UNELEVATED_CLIENTS.set(true);
+}
+
+pub(crate) fn probe_local_server(path: &std::path::Path) -> std::io::Result<()> {
+    use interprocess::os::windows::named_pipe::{pipe_mode::Bytes, DuplexPipeStream};
+    use interprocess::ConnectWaitMode;
+
+    // The local-socket wrapper ignores wait_mode on Windows in interprocess
+    // 2.4.2. Its named-pipe API honors it without importing/reopening a handle.
+    let name = format!(r"\\.\pipe\{}", path.to_string_lossy());
+    DuplexPipeStream::<Bytes>::connect_by_path_with_wait_mode(
+        name.as_str(),
+        ConnectWaitMode::Timeout(Duration::from_millis(500)),
+    )
+    .map(|_| ())
+    .map_err(local_server_connection_error)
+}
+
+pub(crate) fn local_server_security_descriptor(
+) -> std::io::Result<interprocess::os::windows::security_descriptor::SecurityDescriptor> {
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token = null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let token = unsafe { OwnedHandle::from_raw_handle(token) };
+    let mut elevation = TOKEN_ELEVATION::default();
+    let mut needed = 0;
+    if unsafe {
+        GetTokenInformation(
+            token.as_raw_handle(),
+            TokenElevation,
+            (&mut elevation as *mut TOKEN_ELEVATION).cast(),
+            size_of::<TOKEN_ELEVATION>() as u32,
+            &mut needed,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    let allow_unelevated = ALLOW_UNELEVATED_CLIENTS.get().copied().unwrap_or(false);
+    let integrity = if elevation.TokenIsElevated != 0 && !allow_unelevated {
+        "HI"
+    } else {
+        "ME"
+    };
+    // The account DACL alone cannot distinguish ordinary and elevated clients.
+    // The integrity label blocks both reading and writing from lower levels.
+    user_security_descriptor("GRGW", &format!("S:(ML;;NRNW;;;{integrity})"))
+}
+
+fn user_security_descriptor(
+    access: &str,
+    integrity_label: &str,
+) -> std::io::Result<interprocess::os::windows::security_descriptor::SecurityDescriptor> {
+    use interprocess::os::windows::security_descriptor::SecurityDescriptor;
+    use widestring::{U16CStr, U16CString};
+    use windows_sys::Win32::Security::{
+        Authorization::ConvertSidToStringSidW, GetTokenInformation, TokenUser, TOKEN_QUERY,
+        TOKEN_USER,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token = null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let token = unsafe { OwnedHandle::from_raw_handle(token) };
+    let mut needed = 0;
+    unsafe { GetTokenInformation(token.as_raw_handle(), TokenUser, null_mut(), 0, &mut needed) };
+    if needed == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // usize storage keeps TOKEN_USER aligned and its trailing SID alive.
+    let mut buffer = vec![0usize; (needed as usize).div_ceil(size_of::<usize>())];
+    if unsafe {
+        GetTokenInformation(
+            token.as_raw_handle(),
+            TokenUser,
+            buffer.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: GetTokenInformation initialized the aligned TOKEN_USER and SID.
+    let user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
+    let mut sid = null_mut();
+    if unsafe { ConvertSidToStringSidW(user.User.Sid, &mut sid) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let sid_text = unsafe { U16CStr::from_ptr_str(sid) }.to_string_lossy();
+    unsafe { LocalFree(sid.cast()) };
+    // Use the account SID rather than the elevated token's Administrators owner.
+    let sddl = U16CString::from_str(format!(
+        "D:P(A;;GA;;;SY)(A;;{access};;;{sid_text}){integrity_label}"
+    ))
+    .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
+    SecurityDescriptor::deserialize(&sddl)
+}
 
 pub(crate) fn local_server_connection_error(error: std::io::Error) -> std::io::Error {
     if error.kind() != std::io::ErrorKind::PermissionDenied {
@@ -23,8 +138,9 @@ pub(crate) fn local_server_connection_error(error: std::io::Error) -> std::io::E
     std::io::Error::new(
         error.kind(),
         format!(
-            "If this server is elevated, stop it in an admin shell; \
-             reopen Herdr normally (closes panes). {error}"
+            "For an elevated server, use an administrator terminal. Sharing with ordinary \
+             clients requires stopping it there and restarting its `herdr server` command \
+             with --allow-unelevated-clients (closes panes). {error}"
         ),
     )
 }
@@ -190,10 +306,7 @@ pub(crate) fn create_config_temporary(
             .create_new(true)
             .open(path);
     }
-    use interprocess::os::windows::security_descriptor::{
-        AsSecurityDescriptorExt as _, SecurityDescriptor,
-    };
-    use widestring::U16CString;
+    use interprocess::os::windows::security_descriptor::AsSecurityDescriptorExt as _;
     use windows_sys::Win32::{
         Foundation::GENERIC_WRITE,
         Storage::FileSystem::{
@@ -201,9 +314,7 @@ pub(crate) fn create_config_temporary(
             FILE_SHARE_WRITE,
         },
     };
-    let sddl =
-        U16CString::from_str("D:P(A;;GA;;;SY)(A;;GA;;;OW)").map_err(std::io::Error::other)?;
-    let descriptor = SecurityDescriptor::deserialize(&sddl)?;
+    let descriptor = user_security_descriptor("GA", "")?;
     let mut attributes = SECURITY_ATTRIBUTES {
         nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: null_mut(),
@@ -381,13 +492,10 @@ use windows_sys::{
                     KEYBDINPUT, KEYEVENTF_KEYUP,
                 },
             },
-            Shell::{
-                CommandLineToArgvW, ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_TIP,
-                NIIF_INFO, NIIF_NOSOUND, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
-            },
+            Shell::{CommandLineToArgvW, ShellExecuteW},
             WindowsAndMessaging::{
-                CreateWindowExW, DestroyWindow, GetForegroundWindow, GetWindowThreadProcessId,
-                LoadIconW, SendMessageTimeoutW, IDI_APPLICATION, SMTO_ABORTIFHUNG, WM_IME_CONTROL,
+                GetForegroundWindow, GetWindowThreadProcessId, SendMessageTimeoutW,
+                SMTO_ABORTIFHUNG, WM_IME_CONTROL,
             },
         },
     },
@@ -401,6 +509,20 @@ const FOREGROUND_SELECTION_RECHECK: Duration = Duration::from_secs(5);
 const FOREGROUND_SELECTION_CACHE_CAPACITY: usize = 1_024;
 const FOREGROUND_SELECTION_CACHE_RETENTION: Duration = Duration::from_secs(60);
 const PANE_RUNTIME_MARKER_ENV_VAR: &str = "HERDR_PANE_RUNTIME_ID";
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+struct ProcessInspectionCounts {
+    snapshots: u64,
+    opens: u64,
+    command_reads: u64,
+}
+
+#[cfg(test)]
+thread_local! {
+    static PROCESS_INSPECTION_COUNTS: std::cell::RefCell<ProcessInspectionCounts> =
+        std::cell::RefCell::new(ProcessInspectionCounts::default());
+}
 
 /// Native processor architecture of the Windows host as an
 /// `IMAGE_FILE_MACHINE_*` value. `IsWow64Process2` reports the native machine
@@ -743,6 +865,8 @@ enum ProcessIdentity {
 
 impl ProcessIdentity {
     fn open(pid: u32) -> Option<Self> {
+        #[cfg(test)]
+        PROCESS_INSPECTION_COUNTS.with_borrow_mut(|counts| counts.opens += 1);
         let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
         if handle.is_null() {
             return None;
@@ -1516,14 +1640,15 @@ fn select_pane_foreground_job_from_snapshot_with_runtime_inspection(
         return Some(foreground_job_from_entry(shell));
     }
 
-    let Some(shell_runtime_marker) = runtime_marker(shell).filter(|marker| !marker.is_empty())
-    else {
+    let Some(shell_runtime_marker) = pane_runtime_marker(shell, &mut runtime_marker) else {
         return Some(foreground_job_from_entry(shell));
     };
     let matching_candidates: Vec<_> = escaped_agent_indices
         .iter()
         .map(|&index| &entries[index])
-        .filter(|entry| runtime_marker(entry).as_deref() == Some(shell_runtime_marker.as_str()))
+        .filter(|entry| {
+            carries_pane_runtime_marker(entry, &shell_runtime_marker, &mut runtime_marker)
+        })
         .collect();
     let selected =
         select_topmost_agent_chain_candidate(&matching_candidates, snapshot).unwrap_or(shell);
@@ -1539,6 +1664,69 @@ fn select_pane_foreground_job(
         shell_pid,
         &ProcessSnapshot::new(entries.to_vec()),
     )
+}
+
+/// Git Bash can start agents outside the pane shell's process tree. Those
+/// belong to the pane when they carry the runtime marker the shell got.
+fn pane_runtime_marker(
+    shell: &WindowsProcessEntry,
+    runtime_marker: &mut impl FnMut(&WindowsProcessEntry) -> Option<String>,
+) -> Option<String> {
+    runtime_marker(shell).filter(|marker| !marker.is_empty())
+}
+
+fn carries_pane_runtime_marker(
+    entry: &WindowsProcessEntry,
+    pane_marker: &str,
+    runtime_marker: &mut impl FnMut(&WindowsProcessEntry) -> Option<String>,
+) -> bool {
+    runtime_marker(entry).as_deref() == Some(pane_marker)
+}
+
+/// Whether foreground selection could pick `pid` for this pane: a descendant
+/// of the pane shell, or an escaped Git Bash agent with the pane's marker.
+fn process_belongs_to_pane(
+    shell_pid: u32,
+    pid: u32,
+    snapshot: &ProcessSnapshot,
+    shell_is_git_bash: impl FnOnce(&WindowsProcessEntry) -> bool,
+    mut runtime_marker: impl FnMut(&WindowsProcessEntry) -> Option<String>,
+) -> bool {
+    if process_is_ancestor(shell_pid, pid, snapshot) {
+        return true;
+    }
+    let (Some(shell), Some(entry)) = (snapshot.entry(shell_pid), snapshot.entry(pid)) else {
+        return false;
+    };
+    shell_is_git_bash(shell)
+        && process_entry_identifies_agent(entry)
+        && pane_runtime_marker(shell, &mut runtime_marker).is_some_and(|pane_marker| {
+            carries_pane_runtime_marker(entry, &pane_marker, &mut runtime_marker)
+        })
+}
+
+/// Creation time of `pid`. It tells a process apart from a later one that
+/// reuses its pid.
+pub fn process_start_token(pid: u32) -> Option<u64> {
+    ProcessIdentity::open(pid)?.creation_time()
+}
+
+/// Returns `pid` while that same process, matched by its creation time, is
+/// still running for the pane shell `shell_pid`. Windows has no job control,
+/// so the process stands in for its own group.
+pub fn live_pane_process_group(shell_pid: u32, pid: u32, start_token: u64) -> Option<u32> {
+    let identity = ProcessIdentity::open(pid)?;
+    if !identity.running() || identity.creation_time() != Some(start_token) {
+        return None;
+    }
+    process_belongs_to_pane(
+        shell_pid,
+        pid,
+        &cached_foreground_processes(),
+        |shell| process_is_git_bash(shell.pid),
+        |entry| process_runtime_marker(entry.pid),
+    )
+    .then_some(pid)
 }
 
 fn process_entry_identifies_agent(entry: &WindowsProcessEntry) -> bool {
@@ -1626,6 +1814,8 @@ fn foreground_process_from_entry(entry: &WindowsProcessEntry) -> super::Foregrou
 }
 
 fn snapshot_processes() -> Vec<WindowsProcessEntry> {
+    #[cfg(test)]
+    PROCESS_INSPECTION_COUNTS.with_borrow_mut(|counts| counts.snapshots += 1);
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
     if snapshot == INVALID_HANDLE_VALUE {
         return Vec::new();
@@ -1671,7 +1861,7 @@ fn prepare_cached_foreground_selection(
     snapshot: &ProcessSnapshot,
     job: &ForegroundJob,
 ) -> Option<CachedForegroundSelection> {
-    if job.process_group_id == shell_pid {
+    if !CachedForegroundSelection::can_cache(shell_pid, snapshot, job) {
         return None;
     }
     let shell_identity = ProcessIdentity::open(shell_pid)?;
@@ -1693,6 +1883,17 @@ fn prepare_cached_foreground_selection(
 }
 
 impl CachedForegroundSelection {
+    fn can_cache(shell_pid: u32, snapshot: &ProcessSnapshot, job: &ForegroundJob) -> bool {
+        // Idle native shells cannot use Git Bash's escaped-agent fallback.
+        // Keep reevaluating unknown children; a first child invalidates topology.
+        job.process_group_id != shell_pid
+            || (snapshot.entry(shell_pid).is_some_and(|shell| {
+                ["cmd.exe", "powershell.exe", "pwsh.exe"]
+                    .iter()
+                    .any(|name| shell.name.eq_ignore_ascii_case(name))
+            }) && !snapshot.children_by_parent.contains_key(&shell_pid))
+    }
+
     fn from_snapshot_with_identities(
         shell_pid: u32,
         snapshot: &ProcessSnapshot,
@@ -1702,7 +1903,7 @@ impl CachedForegroundSelection {
         shell_identity: ProcessIdentity,
         selected_identity: ProcessIdentity,
     ) -> Option<Self> {
-        if job.process_group_id == shell_pid {
+        if !Self::can_cache(shell_pid, snapshot, job) {
             return None;
         }
         let shell_entry = snapshot.entry(shell_pid)?;
@@ -2178,6 +2379,8 @@ fn environment_variable_from_utf16(environment: &[u16], name: &str) -> Option<St
 /// Returns `None` for a process without a stored command line; the caller then
 /// tries the PEB path before giving up.
 fn read_process_command_line(process: HANDLE) -> Option<String> {
+    #[cfg(test)]
+    PROCESS_INSPECTION_COUNTS.with_borrow_mut(|counts| counts.command_reads += 1);
     let mut required = 0_u32;
     // SAFETY: a null buffer with length 0 only asks for the required size, and
     // `required` is a valid out-pointer for the duration of the call.
@@ -2594,112 +2797,6 @@ fn clipboard_global_bytes(format: u32, max_bytes: usize) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
-pub fn show_desktop_notification(title: &str, body: Option<&str>) -> std::io::Result<bool> {
-    let title = title.to_owned();
-    let body = body.unwrap_or(&title).to_owned();
-    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
-    std::thread::Builder::new()
-        .name("herdr-windows-notification".into())
-        .spawn(move || show_desktop_notification_on_thread(&title, &body, ready_tx))?;
-    ready_rx
-        .recv_timeout(Duration::from_secs(2))
-        .map_err(|err| match err {
-            std::sync::mpsc::RecvTimeoutError::Timeout => std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "Windows notification setup timed out",
-            ),
-            std::sync::mpsc::RecvTimeoutError::Disconnected => std::io::Error::other(
-                "Windows notification thread exited before reporting readiness",
-            ),
-        })?
-}
-
-fn show_desktop_notification_on_thread(
-    title: &str,
-    body: &str,
-    ready_tx: std::sync::mpsc::SyncSender<std::io::Result<bool>>,
-) {
-    let class_name = wide_null("STATIC");
-    let window_name = wide_null("Herdr notifications");
-    let hwnd = unsafe {
-        CreateWindowExW(
-            0,
-            class_name.as_ptr(),
-            window_name.as_ptr(),
-            0,
-            0,
-            0,
-            0,
-            0,
-            null_mut(),
-            null_mut(),
-            null_mut(),
-            std::ptr::null(),
-        )
-    };
-    if hwnd.is_null() {
-        let _ = ready_tx.send(Err(std::io::Error::last_os_error()));
-        return;
-    }
-
-    let mut notification = unsafe { std::mem::zeroed::<NOTIFYICONDATAW>() };
-    notification.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
-    notification.hWnd = hwnd;
-    notification.uID = 1;
-    notification.hIcon = unsafe { LoadIconW(null_mut(), IDI_APPLICATION) };
-    notification.uFlags = NIF_TIP;
-    if !notification.hIcon.is_null() {
-        notification.uFlags |= NIF_ICON;
-    }
-    copy_wide_truncated(&mut notification.szTip, "Herdr");
-
-    if unsafe { Shell_NotifyIconW(NIM_ADD, &notification) } == 0 {
-        let _ = ready_tx.send(Err(std::io::Error::other(
-            "failed to add Herdr notification-area icon",
-        )));
-        unsafe {
-            DestroyWindow(hwnd);
-        }
-        return;
-    }
-
-    notification.uFlags = NIF_INFO;
-    notification.dwInfoFlags = NIIF_INFO | NIIF_NOSOUND;
-    copy_wide_truncated(&mut notification.szInfoTitle, title);
-    copy_wide_truncated(&mut notification.szInfo, body);
-    if unsafe { Shell_NotifyIconW(NIM_MODIFY, &notification) } == 0 {
-        unsafe {
-            Shell_NotifyIconW(NIM_DELETE, &notification);
-            DestroyWindow(hwnd);
-        }
-        let _ = ready_tx.send(Err(std::io::Error::other(
-            "failed to show Herdr desktop notification",
-        )));
-        return;
-    }
-
-    let _ = ready_tx.send(Ok(true));
-    std::thread::sleep(Duration::from_secs(10));
-    unsafe {
-        Shell_NotifyIconW(NIM_DELETE, &notification);
-        DestroyWindow(hwnd);
-    }
-}
-
-fn copy_wide_truncated<const N: usize>(destination: &mut [u16; N], value: &str) {
-    destination.fill(0);
-    let mut offset = 0;
-    for ch in value.chars() {
-        let mut units = [0; 2];
-        let encoded = ch.encode_utf16(&mut units);
-        if offset + encoded.len() >= N {
-            break;
-        }
-        destination[offset..offset + encoded.len()].copy_from_slice(encoded);
-        offset += encoded.len();
-    }
-}
-
 fn wide_null(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
 }
@@ -2721,6 +2818,8 @@ impl ProcessHandle {
         if pid == 0 {
             return None;
         }
+        #[cfg(test)]
+        PROCESS_INSPECTION_COUNTS.with_borrow_mut(|counts| counts.opens += 1);
         let handle = unsafe { OpenProcess(access, 0, pid) };
         (!handle.is_null()).then_some(Self(handle))
     }
@@ -3134,6 +3233,152 @@ mod tests {
     };
 
     #[test]
+    fn local_resources_authorize_account_without_admin_rights() {
+        use interprocess::local_socket::traits::Listener as _;
+        use std::io::{Read, Write};
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::Security::{
+            CreateRestrictedToken, GetTokenInformation, ImpersonateLoggedOnUser, RevertToSelf,
+            TokenUser, DISABLE_MAX_PRIVILEGE, LUA_TOKEN, SID_AND_ATTRIBUTES, TOKEN_DUPLICATE,
+            TOKEN_QUERY, TOKEN_USER,
+        };
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+        let path =
+            std::env::temp_dir().join(format!("herdr-user-pipe-{}.sock", std::process::id()));
+        let listener = crate::ipc::bind_local_listener(&path).unwrap();
+        let mut raw_token = std::ptr::null_mut();
+        assert_ne!(
+            unsafe {
+                OpenProcessToken(
+                    GetCurrentProcess(),
+                    TOKEN_DUPLICATE | TOKEN_QUERY,
+                    &mut raw_token,
+                )
+            },
+            0
+        );
+        let token = unsafe { OwnedHandle::from_raw_handle(raw_token) };
+        let mut restricted = std::ptr::null_mut();
+        assert_ne!(
+            unsafe {
+                CreateRestrictedToken(
+                    token.as_raw_handle(),
+                    DISABLE_MAX_PRIVILEGE | LUA_TOKEN,
+                    0,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    &mut restricted,
+                )
+            },
+            0
+        );
+        let restricted = unsafe { OwnedHandle::from_raw_handle(restricted) };
+        let private_path = path.with_extension("private");
+        super::create_config_temporary(&private_path, true)
+            .unwrap()
+            .write_all(b"recovery")
+            .unwrap();
+        assert_ne!(
+            unsafe { ImpersonateLoggedOnUser(restricted.as_raw_handle()) },
+            0
+        );
+        let connection = crate::ipc::connect_local_stream(&path);
+        let private_read = fs::read(&private_path);
+        let private_write = fs::write(&private_path, b"updated");
+        let reverted = unsafe { RevertToSelf() };
+        assert_ne!(reverted, 0);
+        assert_eq!(private_read.unwrap(), b"recovery");
+        private_write.unwrap();
+        let mut client = connection.expect("the account SID must work without admin membership");
+        let mut server = listener.accept().unwrap();
+        client.write_all(b"account").unwrap();
+        let mut received = [0; 7];
+        server.read_exact(&mut received).unwrap();
+        assert_eq!(&received, b"account");
+
+        // Removing the account SID must not leave access through Everyone or
+        // another ordinary group. This exercises the real DACL access check.
+        let mut size = 0;
+        unsafe {
+            GetTokenInformation(
+                token.as_raw_handle(),
+                TokenUser,
+                std::ptr::null_mut(),
+                0,
+                &mut size,
+            )
+        };
+        let mut user = vec![0usize; (size as usize).div_ceil(std::mem::size_of::<usize>())];
+        assert_ne!(
+            unsafe {
+                GetTokenInformation(
+                    token.as_raw_handle(),
+                    TokenUser,
+                    user.as_mut_ptr().cast(),
+                    size,
+                    &mut size,
+                )
+            },
+            0
+        );
+        let user = unsafe { &*user.as_ptr().cast::<TOKEN_USER>() };
+        let disabled = SID_AND_ATTRIBUTES {
+            Sid: user.User.Sid,
+            Attributes: 0,
+        };
+        let mut without_account = std::ptr::null_mut();
+        assert_ne!(
+            unsafe {
+                CreateRestrictedToken(
+                    token.as_raw_handle(),
+                    DISABLE_MAX_PRIVILEGE | LUA_TOKEN,
+                    1,
+                    &disabled,
+                    0,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    &mut without_account,
+                )
+            },
+            0
+        );
+        let without_account = unsafe { OwnedHandle::from_raw_handle(without_account) };
+        assert_ne!(
+            unsafe { ImpersonateLoggedOnUser(without_account.as_raw_handle()) },
+            0
+        );
+        let denied = crate::ipc::connect_local_stream(&path);
+        let private_denied = fs::read(&private_path);
+        let reverted = unsafe { RevertToSelf() };
+        assert_ne!(reverted, 0);
+        assert_eq!(
+            denied.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            private_denied.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_ne!(
+            unsafe { ImpersonateLoggedOnUser(restricted.as_raw_handle()) },
+            0
+        );
+        let removed = fs::remove_file(private_path);
+        let reverted = unsafe { RevertToSelf() };
+        assert_ne!(reverted, 0);
+        removed.expect("the account must be able to remove its private recovery files");
+        drop(client);
+        drop(server);
+        drop(listener);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn clipboard_text_equals_normalizes_line_endings() {
         assert!(super::clipboard_text_equals("hello", b"hello"));
         assert!(super::clipboard_text_equals("a\r\nb", b"a\nb"));
@@ -3333,15 +3578,6 @@ mod tests {
             )),
             None
         );
-    }
-
-    #[test]
-    fn windows_notification_text_is_null_terminated_and_unicode_safe() {
-        let mut destination = [u16::MAX; 6];
-        super::copy_wide_truncated(&mut destination, "abc😀def");
-
-        assert_eq!(String::from_utf16(&destination[..5]).unwrap(), "abc😀");
-        assert_eq!(destination[5], 0);
     }
 
     #[test]
@@ -4091,6 +4327,50 @@ mod tests {
     }
 
     #[test]
+    fn windows_held_agent_must_still_belong_to_the_pane() {
+        let entries = vec![
+            test_entry(10, 1, "bash.exe", &[r"C:\Program Files\Git\bin\bash.exe"]),
+            test_entry(11, 10, "claude.exe", &["claude.exe"]),
+            test_entry(20, 99, "codex.exe", &["codex.exe"]),
+            test_entry(30, 98, "vim.exe", &["vim.exe"]),
+            test_entry(50, 77, "claude.exe", &["claude.exe"]),
+        ];
+        let snapshot = super::ProcessSnapshot::new(entries);
+        let marker = |pane: &'static str| {
+            move |entry: &super::WindowsProcessEntry| {
+                Some(if entry.pid == 10 { "pane-a" } else { pane }.to_string())
+            }
+        };
+        let belongs = |pid, git_bash, pane| {
+            super::process_belongs_to_pane(10, pid, &snapshot, |_| git_bash, marker(pane))
+        };
+
+        assert!(belongs(11, false, "pane-b"), "descendant of the shell");
+        assert!(
+            belongs(20, true, "pane-a"),
+            "escaped agent with the pane marker"
+        );
+        assert!(!belongs(20, true, "pane-b"), "marker from another pane");
+        assert!(
+            !belongs(20, false, "pane-a"),
+            "escape only applies to Git Bash"
+        );
+        assert!(!belongs(30, true, "pane-a"), "escaped non-agent process");
+        assert!(
+            !belongs(40, true, "pane-a"),
+            "process gone from the snapshot"
+        );
+        assert!(
+            !belongs(50, false, "pane-a"),
+            "agent whose parent chain no longer reaches the shell"
+        );
+        assert!(
+            !super::process_belongs_to_pane(60, 11, &snapshot, |_| true, marker("pane-a")),
+            "pane shell gone"
+        );
+    }
+
+    #[test]
     fn windows_process_tree_rejects_ambiguous_runtime_marker_candidates() {
         let entries = vec![
             test_entry(10, 1, "bash.exe", &[r"C:\Program Files\Git\bin\bash.exe"]),
@@ -4109,6 +4389,131 @@ mod tests {
 
         assert_eq!(job.process_group_id, 10);
         assert_eq!(job.processes[0].name, "bash.exe");
+    }
+
+    #[test]
+    #[ignore = "isolated 1/15/118-shell process-inspection profile"]
+    fn windows_process_inspection_profile() {
+        struct Shell {
+            child: Box<dyn portable_pty::Child + Send + Sync>,
+            pty: Option<portable_pty::PtyPair>,
+            reader: Option<thread::JoinHandle<()>>,
+        }
+        impl Drop for Shell {
+            fn drop(&mut self) {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                self.pty.take();
+                if let Some(reader) = self.reader.take() {
+                    let _ = reader.join();
+                }
+            }
+        }
+
+        fn cpu_time() -> Duration {
+            let mut creation = super::FILETIME::default();
+            let mut exit = super::FILETIME::default();
+            let mut kernel = super::FILETIME::default();
+            let mut user = super::FILETIME::default();
+            assert_ne!(
+                unsafe {
+                    super::GetProcessTimes(
+                        super::GetCurrentProcess(),
+                        &mut creation,
+                        &mut exit,
+                        &mut kernel,
+                        &mut user,
+                    )
+                },
+                0
+            );
+            let ticks = |time: super::FILETIME| {
+                (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime)
+            };
+            Duration::from_nanos((ticks(kernel) + ticks(user)) * 100)
+        }
+
+        let shell =
+            std::path::PathBuf::from(std::env::var_os("SystemRoot").expect("Windows SystemRoot"))
+                .join("System32")
+                .join("cmd.exe");
+        for panes in [1, 15, 118] {
+            let mut shells = Vec::new();
+            for _ in 0..panes {
+                let pty = portable_pty::native_pty_system()
+                    .openpty(portable_pty::PtySize {
+                        rows: 24,
+                        cols: 80,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    })
+                    .expect("open isolated fixed-geometry PTY");
+                let mut command = portable_pty::CommandBuilder::new(&shell);
+                command.args(["/D", "/Q", "/K"]);
+                let child = pty
+                    .slave
+                    .spawn_command(command)
+                    .expect("spawn isolated idle shell");
+                let mut reader = pty
+                    .master
+                    .try_clone_reader()
+                    .expect("clone profile PTY reader");
+                shells.push(Shell {
+                    child,
+                    pty: Some(pty),
+                    reader: Some(thread::spawn(move || {
+                        let _ = std::io::copy(&mut reader, &mut std::io::sink());
+                    })),
+                });
+            }
+            thread::sleep(Duration::from_millis(300));
+            let snapshot = super::ProcessSnapshot::new(super::snapshot_processes());
+            for shell in &shells {
+                assert!(
+                    super::descendant_entries(shell.child.process_id().unwrap(), &snapshot)
+                        .is_empty()
+                );
+            }
+            for sample in 0..3 {
+                super::FOREGROUND_PROCESS_SNAPSHOT_CACHE
+                    .lock()
+                    .unwrap()
+                    .cached = None;
+                super::FOREGROUND_SELECTION_CACHE
+                    .lock()
+                    .unwrap()
+                    .entries
+                    .clear();
+                super::PROCESS_INSPECTION_COUNTS
+                    .with_borrow_mut(|counts| *counts = super::ProcessInspectionCounts::default());
+                let started = Instant::now();
+                let cpu_started = cpu_time();
+                let mut inspection_time = Duration::ZERO;
+                for poll in 0..20 {
+                    let next_poll = started + Duration::from_millis(poll * 500);
+                    thread::sleep(next_poll.saturating_duration_since(Instant::now()));
+                    let inspecting = Instant::now();
+                    for shell in &mut shells {
+                        assert!(shell.child.try_wait().unwrap().is_none());
+                        let pid = shell.child.process_id().unwrap();
+                        let job = super::foreground_job(pid).expect("live shell job");
+                        assert_eq!(job.process_group_id, pid);
+                    }
+                    inspection_time += inspecting.elapsed();
+                }
+                let cpu = cpu_time() - cpu_started;
+                let counts = super::PROCESS_INSPECTION_COUNTS.with_borrow(|counts| *counts);
+                println!(
+                    "panes={panes} sample={sample} polls=20 snapshots={} opens={} command_reads={} inspection_ms={:.3} cpu_ms={:.3} elapsed_ms={:.3}",
+                    counts.snapshots,
+                    counts.opens,
+                    counts.command_reads,
+                    inspection_time.as_secs_f64() * 1000.0,
+                    cpu.as_secs_f64() * 1000.0,
+                    started.elapsed().as_secs_f64() * 1000.0,
+                );
+            }
+        }
     }
 
     #[test]
@@ -4306,19 +4711,69 @@ mod tests {
     }
 
     #[test]
-    fn windows_foreground_selection_cache_does_not_retain_shell_result() {
-        let snapshot = super::ProcessSnapshot::new(vec![test_entry(
-            10,
-            1,
-            "powershell.exe",
-            &["powershell.exe"],
-        )]);
-        let shell = super::foreground_job_from_entry(snapshot.entry(10).unwrap());
-        let mut cache = super::ForegroundSelectionCache::default();
+    fn windows_foreground_selection_cache_retains_idle_native_shell_until_launch_or_exit() {
+        for name in ["cmd.exe", "powershell.exe", "PWSH.EXE"] {
+            let snapshot = super::ProcessSnapshot::new(vec![test_entry(10, 1, name, &[name])]);
+            let shell = super::foreground_job_from_entry(snapshot.entry(10).unwrap());
+            let mut cache = super::ForegroundSelectionCache::default();
+            cache.remember_for_test(10, &snapshot, &shell);
+            assert_eq!(cache.get(10, &snapshot), Some(shell.clone()));
 
-        cache.remember_for_test(10, &snapshot, &shell);
+            let launched = super::ProcessSnapshot::new(vec![
+                test_entry(10, 1, name, &[name]),
+                test_entry(20, 10, "codex.exe", &["codex.exe"]),
+            ]);
+            assert_eq!(cache.get(10, &launched), None);
+            let agent = super::select_pane_foreground_job_from_snapshot_with_runtime_inspection(
+                10,
+                &launched,
+                |_| panic!("direct child must bypass escaped-agent inspection"),
+                |_| panic!("direct child must bypass runtime markers"),
+            )
+            .unwrap();
+            assert_eq!(agent.process_group_id, 20);
+            cache.remember_for_test(10, &launched, &agent);
+            assert_eq!(cache.get(10, &snapshot), None);
 
-        assert!(cache.entries.is_empty());
+            cache.remember_for_test(10, &snapshot, &shell);
+            assert_eq!(cache.get(10, &snapshot), Some(shell.clone()));
+            let short_lived_child = super::ProcessSnapshot::new(vec![
+                test_entry(10, 1, name, &[name]),
+                test_entry(21, 10, "git.exe", &["git.exe"]),
+            ]);
+            assert_eq!(cache.get(10, &short_lived_child), None);
+            cache.remember_for_test(10, &snapshot, &shell);
+            cache.entries.get_mut(&10).unwrap().shell_identity = super::ProcessIdentity::Stub {
+                running: false,
+                creation_time: None,
+            };
+            // An identical fresh signature must not hide shell exit/PID reuse.
+            assert_eq!(cache.get(10, &snapshot), None);
+
+            cache.remember_for_test(10, &snapshot, &shell);
+            cache.entries.get_mut(&10).unwrap().verified_at = Instant::now()
+                .checked_sub(super::FOREGROUND_SELECTION_RECHECK + Duration::from_secs(1))
+                .unwrap();
+            assert_eq!(cache.get(10, &snapshot), None);
+        }
+    }
+
+    #[test]
+    fn windows_foreground_selection_cache_keeps_escaped_and_unknown_children_fresh() {
+        for entries in [
+            vec![test_entry(10, 1, "bash.exe", &["bash.exe"])],
+            vec![test_entry(10, 1, "launcher.exe", &["launcher.exe"])],
+            vec![
+                test_entry(10, 1, "pwsh.exe", &["pwsh.exe"]),
+                test_entry(20, 10, "node.exe", &["node.exe", "worker.js"]),
+            ],
+        ] {
+            let snapshot = super::ProcessSnapshot::new(entries);
+            let shell = super::foreground_job_from_entry(snapshot.entry(10).unwrap());
+            let mut cache = super::ForegroundSelectionCache::default();
+            cache.remember_for_test(10, &snapshot, &shell);
+            assert_eq!(cache.get(10, &snapshot), None);
+        }
     }
 
     #[test]
